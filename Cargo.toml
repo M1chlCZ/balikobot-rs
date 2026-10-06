@@ -1,0 +1,17 @@
+[package]
+name = "balikobot"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust client for the Balikobot shipping API v2: packages, labels, tracking, pickups, and carrier capabilities."
+repository = "https://github.com/M1chlCZ/balikobot-rs"
+license = "MIT"
+readme = "README.md"
+keywords = ["balikobot", "shipping", "api", "client"]
+categories = ["api-bindings"]
+
+[dependencies]
+ureq = { version = "3.4", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+url = "2.5"
+base64 = "0.23"
