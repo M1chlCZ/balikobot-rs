@@ -99,11 +99,14 @@ impl CountryCode {
 
     /// Normalizes a country code and returns it. The value is trimmed and
     /// uppercased, so custom countries work too. A malformed value returns
-    /// [`Error::InvalidRequest`].
+    /// [`Error::InvalidCode`].
     pub fn new(value: &str) -> Result<Self> {
-        let normalized = value.trim().to_ascii_uppercase();
+        let normalized = value.trim().to_uppercase();
         if !valid(&normalized) {
-            return Err(Error::InvalidRequest);
+            return Err(Error::InvalidCode {
+                kind: "country",
+                value: value.to_owned(),
+            });
         }
         Ok(Self(Cow::Owned(normalized)))
     }
@@ -165,7 +168,13 @@ mod tests {
 
     #[test]
     fn new_rejects_malformed_value() {
-        assert_eq!(CountryCode::new("D3"), Err(Error::InvalidRequest));
+        assert_eq!(
+            CountryCode::new("D3"),
+            Err(Error::InvalidCode {
+                kind: "country",
+                value: "D3".to_owned(),
+            })
+        );
     }
 
     #[test]

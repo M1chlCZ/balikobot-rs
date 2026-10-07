@@ -1,4 +1,12 @@
 //! A Rust client for the Balikobot shipping API v2.
+//!
+//! The crate wraps the JSON API for packages, labels, tracking, pickups, and
+//! carrier capabilities in a blocking client. Build a [`Client`] from a
+//! [`Config`] and call its methods; every failure is returned as a typed
+//! [`Error`] that separates local request validation, permanent refusals,
+//! temporary unavailability, and ambiguous mutating outcomes.
+
+#![forbid(unsafe_code)]
 
 pub mod client;
 pub mod codes;

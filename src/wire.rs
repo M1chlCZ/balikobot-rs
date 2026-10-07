@@ -16,7 +16,7 @@ use url::Url;
 use crate::Error;
 use crate::client::Client;
 use crate::codes::{CountryCode, CurrencyCode};
-use crate::config::{host_is_loopback, host_with_port};
+use crate::config::{host_is_loopback, host_with_port, raw_authority_has_userinfo};
 use crate::models::{Branch, CODCapability, Carrier, Service};
 
 const MAX_RETRY_AFTER_SECONDS: u64 = 3600;
@@ -86,21 +86,23 @@ pub fn request(
         .run(request)
         .map_err(RequestFailure::Transport)?;
     let (parts, body) = response.into_parts();
-    let limit = client.max_response_bytes;
-    let mut reader = body.into_reader();
-    let mut body = Vec::new();
-    reader
-        .by_ref()
-        .take(limit as u64 + 1)
-        .read_to_end(&mut body)
-        .map_err(|error| RequestFailure::Transport(ureq::Error::Io(error)))?;
-    if body.len() > limit {
-        return Err(RequestFailure::BodyLimit);
+    let mut bytes = Vec::new();
+    if parts.status.as_u16() == 200 {
+        let limit = client.max_response_bytes;
+        let mut reader = body.into_reader();
+        reader
+            .by_ref()
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| RequestFailure::Transport(ureq::Error::Io(error)))?;
+        if bytes.len() > limit {
+            return Err(RequestFailure::BodyLimit);
+        }
     }
     Ok(RawResponse {
         status: parts.status.as_u16(),
         headers: parts.headers,
-        body,
+        body: bytes,
     })
 }
 
@@ -110,8 +112,26 @@ pub fn is_json(response: &RawResponse) -> bool {
         .headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+        .and_then(parse_media_type)
+        .is_some_and(|media_type| media_type == "application/json")
+}
+
+/// Parses a content type into its lowercased media type. Every parameter after
+/// the first must carry a non-empty name before an `=`, like Go's
+/// `mime.ParseMediaType`.
+pub(crate) fn parse_media_type(value: &str) -> Option<String> {
+    let mut parts = value.split(';');
+    let media_type = parts.next()?.trim().to_ascii_lowercase();
+    if media_type.is_empty() || !parts.all(valid_media_parameter) {
+        return None;
+    }
+    Some(media_type)
+}
+
+fn valid_media_parameter(parameter: &str) -> bool {
+    parameter
+        .split_once('=')
+        .is_some_and(|(name, _)| !name.trim().is_empty())
 }
 
 /// Returns the integer `Retry-After` hint, clamped to one hour.
@@ -202,13 +222,13 @@ pub fn valid_label_url(client: &Client, raw: &str) -> bool {
     let Ok(url) = Url::parse(raw) else {
         return false;
     };
+    if raw_authority_has_userinfo(raw) || !raw_path_is_explicit(raw) {
+        return false;
+    }
     if !url.username().is_empty() || url.password().is_some() {
         return false;
     }
     if url.fragment().is_some_and(|fragment| !fragment.is_empty()) {
-        return false;
-    }
-    if url.path().is_empty() {
         return false;
     }
     if url
@@ -238,6 +258,17 @@ pub fn dispatch_error(error: &ureq::Error) -> Error {
         }
         _ => Error::Ambiguous,
     }
+}
+
+/// Reports whether the raw URL spells an explicit path after the authority.
+/// The `url` crate normalizes a missing path to `/`, so the raw text is the
+/// only place where an absent path is visible.
+fn raw_path_is_explicit(raw: &str) -> bool {
+    let Some((_, remainder)) = raw.split_once("://") else {
+        return false;
+    };
+    let index = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    remainder.as_bytes().get(index) == Some(&b'/')
 }
 
 fn label_host_allowed(url: &Url, allowed_hosts: &[String]) -> bool {
@@ -451,7 +482,7 @@ pub struct LabelsResponse {
     pub labels_url: String,
 }
 
-/// The decoded body of an `ORDERV` response.
+/// The decoded body of an `ORDERVIEW` response.
 #[derive(Debug, Default, Deserialize)]
 pub struct OrderViewResponse {
     /// The top-level body status, when the provider sent a valid one.
@@ -550,7 +581,7 @@ pub fn parse_labels(body: &[u8]) -> Option<LabelsResponse> {
     parse_object(body)
 }
 
-/// Decodes an `ORDERV` response body.
+/// Decodes an `ORDERVIEW` response body.
 pub fn parse_order_view(body: &[u8]) -> Option<OrderViewResponse> {
     parse_object(body)
 }
@@ -814,7 +845,9 @@ fn package_id_from_raw(text: &str) -> Option<String> {
 
 /// Reports whether a value is usable as a package or order reference.
 pub(crate) fn valid_package_id(value: &str) -> bool {
-    !value.is_empty() && valid_branch_field(value, IDENTIFIER_LIMIT)
+    !value.is_empty()
+        && value.len() <= IDENTIFIER_LIMIT
+        && valid_branch_field(value, IDENTIFIER_LIMIT)
 }
 
 pub(crate) fn valid_branch_id(value: &str) -> bool {
@@ -1458,6 +1491,26 @@ mod tests {
     }
 
     #[test]
+    fn json_content_type_rejects_malformed_parameters() {
+        assert!(!is_json(&response(&[(
+            "content-type",
+            "application/json; charset"
+        )])));
+        assert!(!is_json(&response(&[(
+            "content-type",
+            "application/json; =utf-8"
+        )])));
+        assert!(!is_json(&response(&[(
+            "content-type",
+            "application/json;"
+        )])));
+        assert!(is_json(&response(&[(
+            "content-type",
+            "application/json; charset=utf-8; profile=x"
+        )])));
+    }
+
+    #[test]
     fn retry_after_parses_and_clamps() {
         assert_eq!(
             retry_after(&response(&[("retry-after", "12")])),
@@ -1497,6 +1550,23 @@ mod tests {
             &client,
             "https://pdf.balikobot.cz/label.pdf#f"
         ));
+        assert!(valid_label_url(&client, "https://pdf.balikobot.cz/"));
+        assert!(!valid_label_url(&client, "https://pdf.balikobot.cz"));
+        assert!(!valid_label_url(&client, "https://pdf.balikobot.cz?zpl=1"));
+        assert!(!valid_label_url(
+            &client,
+            "https://@pdf.balikobot.cz/label.pdf"
+        ));
+    }
+
+    #[test]
+    fn package_id_limit_counts_bytes_not_characters() {
+        let multibyte = "ž".repeat(60);
+        assert_eq!(multibyte.chars().count(), 60);
+        assert!(multibyte.len() > IDENTIFIER_LIMIT);
+        assert!(!valid_package_id(&multibyte));
+        assert!(valid_package_id(&"a".repeat(IDENTIFIER_LIMIT)));
+        assert!(!valid_package_id(&"a".repeat(IDENTIFIER_LIMIT + 1)));
     }
 
     #[test]

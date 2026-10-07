@@ -748,14 +748,14 @@ impl Client {
                 Error::InvalidResponse
             });
         }
-        let media_type = parts
+        let Some(media_type) = parts
             .headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default();
+            .and_then(wire::parse_media_type)
+        else {
+            return Err(Error::InvalidResponse);
+        };
         let mut reader = body.into_reader();
         let mut bytes = Vec::new();
         if reader

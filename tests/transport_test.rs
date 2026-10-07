@@ -81,6 +81,7 @@ fn invalid_configurations_are_rejected() {
         Config::new("user", "key").with_base_url("https://example.com/api"),
         Config::new("user", "key").with_base_url("https://example.com?query=1"),
         Config::new("user", "key").with_base_url("https://example.com#fragment"),
+        Config::new("user", "key").with_base_url("https://@example.com"),
         Config::new("user", "key").with_base_url("ftp://example.com"),
         Config::new("user", "key").with_max_response_bytes((1 << 30) + 1),
         Config::new("user", "key").with_label_hosts(["bad/host"]),

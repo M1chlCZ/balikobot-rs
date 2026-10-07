@@ -5,6 +5,7 @@ use std::time::Duration;
 
 /// The error type of the Balíkobot client.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Arguments rejected locally before any network call.
     InvalidRequest,
@@ -25,6 +26,14 @@ pub enum Error {
     InvalidResponse,
     /// An invalid client configuration.
     Config(String),
+    /// An invalid value passed to a code constructor. `kind` names the code
+    /// family, for example `"carrier"`.
+    InvalidCode {
+        /// The code family, one of `"carrier"`, `"currency"`, or `"country"`.
+        kind: &'static str,
+        /// The rejected value.
+        value: String,
+    },
 }
 
 impl Error {
@@ -55,6 +64,9 @@ impl fmt::Display for Error {
             Self::Ambiguous => f.write_str("balikobot: request outcome is unknown"),
             Self::InvalidResponse => f.write_str("balikobot: invalid provider response"),
             Self::Config(message) => write!(f, "balikobot: invalid configuration: {message}"),
+            Self::InvalidCode { kind, value } => {
+                write!(f, "balikobot: invalid {kind} code: {value}")
+            }
         }
     }
 }
@@ -88,6 +100,14 @@ mod tests {
         assert_eq!(
             Error::Config("user is required".to_owned()).to_string(),
             "balikobot: invalid configuration: user is required"
+        );
+        assert_eq!(
+            Error::InvalidCode {
+                kind: "carrier",
+                value: "bad code!".to_owned(),
+            }
+            .to_string(),
+            "balikobot: invalid carrier code: bad code!"
         );
     }
 

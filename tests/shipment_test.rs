@@ -141,6 +141,19 @@ fn add_package_reports_a_rejected_request() {
 }
 
 #[test]
+fn add_package_treats_an_oversized_500_body_as_unavailable() {
+    let server = json_serve("500 Internal Server Error", |_| vec![b'x'; 4096]);
+    let config = Config::new("user", "key")
+        .with_base_url(format!("http://127.0.0.1:{}", server.port))
+        .with_max_response_bytes(8);
+    let client = Client::new(config).expect("client");
+    let error = client
+        .add_package(&CarrierCode::PPL, &valid_request())
+        .unwrap_err();
+    assert!(matches!(error, Error::Unavailable { retry_after: None }));
+}
+
+#[test]
 fn overview_returns_packages_and_accepts_integer_ids() {
     let server = json_serve("200 OK", |port| {
         format!(
@@ -187,6 +200,22 @@ fn overview_fails_on_an_invalid_matching_entry() {
     let server = json_serve("200 OK", |_| {
         br#"{"status":200,"packages":[{"eid":"018f00000000400080000000000000aa-S1","carrier_id":"","label_url":""}]}"#
             .to_vec()
+    });
+    let client = loopback_client(server.port);
+    let error = client
+        .overview(&CarrierCode::PPL, "018f00000000400080000000000000aa-S1")
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidResponse));
+}
+
+#[test]
+fn overview_rejects_an_overlong_multibyte_package_id() {
+    let server = json_serve("200 OK", |port| {
+        let package_id = "ž".repeat(60);
+        format!(
+            r#"{{"status":200,"packages":[{{"eid":"018f00000000400080000000000000aa-S1","carrier_id":"C1","package_id":"{package_id}","label_url":"http://127.0.0.1:{port}/a.pdf"}}]}}"#
+        )
+        .into_bytes()
     });
     let client = loopback_client(server.port);
     let error = client
@@ -278,6 +307,19 @@ fn download_label_rejects_a_wrong_media_type() {
     let server = serve("200 OK", &[("content-type", "text/plain")], |_| {
         b"%PDF-1.4".to_vec()
     });
+    let client = loopback_client(server.port);
+    let url = format!("http://127.0.0.1:{}/label.pdf", server.port);
+    let error = client.download_label(&url).unwrap_err();
+    assert!(matches!(error, Error::InvalidResponse));
+}
+
+#[test]
+fn download_label_rejects_a_malformed_content_type() {
+    let server = serve(
+        "200 OK",
+        &[("content-type", "application/pdf; charset")],
+        |_| b"%PDF-1.4".to_vec(),
+    );
     let client = loopback_client(server.port);
     let url = format!("http://127.0.0.1:{}/label.pdf", server.port);
     let error = client.download_label(&url).unwrap_err();

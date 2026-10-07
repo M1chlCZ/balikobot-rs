@@ -103,6 +103,7 @@ pub(crate) fn resolve_base_url(raw: &str) -> Result<(String, String, bool)> {
     let parsed = Url::parse(base).map_err(|_| base_url_absolute_error())?;
     if parsed.cannot_be_a_base()
         || parsed.host().is_none()
+        || raw_authority_has_userinfo(base)
         || !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.query().is_some_and(|query| !query.is_empty())
@@ -128,6 +129,17 @@ pub(crate) fn resolve_base_url(raw: &str) -> Result<(String, String, bool)> {
     }
     let origin = format!("{}://{}", parsed.scheme(), host_with_port(&parsed));
     Ok((base.to_owned(), origin, loopback))
+}
+
+/// Reports whether the raw URL carries a userinfo section before the host.
+/// An empty userinfo such as `https://@example.com` has no parsed username or
+/// password, so only the raw authority exposes it.
+pub(crate) fn raw_authority_has_userinfo(raw: &str) -> bool {
+    let Some((_, remainder)) = raw.split_once("://") else {
+        return false;
+    };
+    let end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    remainder[..end].contains('@')
 }
 
 pub(crate) fn normalize_label_hosts(hosts: &[String]) -> Result<Vec<String>> {
