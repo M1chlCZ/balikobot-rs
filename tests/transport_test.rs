@@ -5,6 +5,8 @@ use std::thread;
 
 use balikobot::wire;
 use balikobot::{Client, Config, Error};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use ureq::http;
 
 struct Canned {
@@ -12,16 +14,16 @@ struct Canned {
     request: Receiver<String>,
 }
 
-fn serve(status_line: &str, headers: &[(&str, &str)], body: &str) -> Canned {
+fn serve(status_line: &str, headers: &[(&str, &str)], body: &[u8]) -> Canned {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("local address").port();
-    let mut response = format!("HTTP/1.1 {status_line}\r\n");
+    let mut response = format!("HTTP/1.1 {status_line}\r\n").into_bytes();
     for (name, value) in headers {
-        response.push_str(&format!("{name}: {value}\r\n"));
+        response.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
-    response.push_str(&format!("content-length: {}\r\n", body.len()));
-    response.push_str("connection: close\r\n\r\n");
-    response.push_str(body);
+    response.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
+    response.extend_from_slice(b"connection: close\r\n\r\n");
+    response.extend_from_slice(body);
     let (sender, request) = mpsc::channel();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
@@ -35,7 +37,7 @@ fn serve(status_line: &str, headers: &[(&str, &str)], body: &str) -> Canned {
             raw.extend_from_slice(&buffer[..count]);
         }
         sender.send(String::from_utf8_lossy(&raw).into_owned()).ok();
-        stream.write_all(response.as_bytes()).expect("write");
+        stream.write_all(&response).expect("write");
         stream.flush().expect("flush");
     });
     Canned { port, request }
@@ -56,7 +58,7 @@ fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
 
 #[test]
 fn loopback_http_base_url_is_accepted() {
-    let server = serve("200 OK", &[], "{}");
+    let server = serve("200 OK", &[], b"{}");
     let config =
         Config::new("user", "key").with_base_url(format!("http://127.0.0.1:{}", server.port));
     assert!(Client::new(config).is_ok());
@@ -91,7 +93,7 @@ fn invalid_configurations_are_rejected() {
 
 #[test]
 fn redirects_are_not_followed() {
-    let server = serve("302 Found", &[("location", "http://example.com/next")], "");
+    let server = serve("302 Found", &[("location", "http://example.com/next")], b"");
     let client = loopback_client(server.port, Config::new("user", "key"));
     let response = wire::request(&client, http::Method::GET, "/redirect", None).expect("response");
     assert_eq!(response.status, 302);
@@ -99,7 +101,7 @@ fn redirects_are_not_followed() {
 
 #[test]
 fn request_carries_basic_auth_and_accept_headers() {
-    let server = serve("200 OK", &[], "{}");
+    let server = serve("200 OK", &[], b"{}");
     let client = loopback_client(server.port, Config::new("user", "secret"));
     wire::request(&client, http::Method::GET, "/info/whoami", None).expect("response");
     let request = server.request.recv().expect("captured request");
@@ -111,14 +113,39 @@ fn request_carries_basic_auth_and_accept_headers() {
 }
 
 #[test]
+fn body_at_the_limit_is_accepted() {
+    let server = serve(
+        "200 OK",
+        &[("content-type", "application/json")],
+        b"01234567",
+    );
+    let config = Config::new("user", "key").with_max_response_bytes(8);
+    let client = loopback_client(server.port, config);
+    let response = wire::request(&client, http::Method::GET, "/exact", None).expect("response");
+    assert_eq!(response.body, b"01234567");
+}
+
+#[test]
 fn oversized_response_body_is_rejected() {
     let server = serve(
         "200 OK",
         &[("content-type", "application/json")],
-        "0123456789",
+        b"0123456789",
     );
     let config = Config::new("user", "key").with_max_response_bytes(8);
     let client = loopback_client(server.port, config);
     let error = wire::request(&client, http::Method::GET, "/big", None).unwrap_err();
-    assert!(matches!(error, Error::InvalidResponse));
+    assert!(matches!(error, wire::RequestFailure::BodyLimit));
+}
+
+#[test]
+fn compressed_body_expanding_past_the_limit_is_rejected() {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&[b'a'; 8192]).expect("compress");
+    let compressed = encoder.finish().expect("finish");
+    let server = serve("200 OK", &[("content-encoding", "gzip")], &compressed);
+    let config = Config::new("user", "key").with_max_response_bytes(4096);
+    let client = loopback_client(server.port, config);
+    let error = wire::request(&client, http::Method::GET, "/zip", None).unwrap_err();
+    assert!(matches!(error, wire::RequestFailure::BodyLimit));
 }

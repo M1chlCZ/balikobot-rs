@@ -1,15 +1,15 @@
 //! The HTTP transport shared by the API methods.
 
-use std::io;
+use std::io::{self, Read};
 use std::time::Duration;
 
 use serde_json::Value;
 use ureq::http;
 use url::Url;
 
+use crate::Error;
 use crate::client::Client;
 use crate::config::{host_is_loopback, host_with_port};
-use crate::{Error, Result};
 
 const MAX_RETRY_AFTER_SECONDS: u64 = 3600;
 const LABEL_QUERY_ZPL: &str = "zpl=1";
@@ -25,13 +25,32 @@ pub struct RawResponse {
     pub body: Vec<u8>,
 }
 
+/// A transport-level request outcome that callers map to the public errors.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum RequestFailure {
+    /// The request could not be completed.
+    Transport(ureq::Error),
+    /// The decoded response body exceeds the configured limit.
+    BodyLimit,
+}
+
+impl From<RequestFailure> for Error {
+    fn from(failure: RequestFailure) -> Self {
+        match failure {
+            RequestFailure::Transport(error) => dispatch_error(&error),
+            RequestFailure::BodyLimit => Error::InvalidResponse,
+        }
+    }
+}
+
 /// Sends a JSON request and returns the response with its body read.
 pub fn request(
     client: &Client,
     method: http::Method,
     path: &str,
     body: Option<&Value>,
-) -> Result<RawResponse> {
+) -> Result<RawResponse, RequestFailure> {
     let url = format!("{}/{}", client.base_url, path.trim_start_matches('/'));
     let mut builder = http::Request::builder()
         .method(method)
@@ -41,25 +60,27 @@ pub fn request(
     let payload = match body {
         Some(value) => {
             builder = builder.header("content-type", "application/json");
-            serde_json::to_vec(value).map_err(|_| Error::InvalidRequest)?
+            serde_json::to_vec(value).expect("JSON values serialize")
         }
         None => Vec::new(),
     };
-    let request = builder.body(payload).map_err(|_| Error::InvalidRequest)?;
+    let request = builder.body(payload).expect("valid request");
     let response = client
         .agent
         .run(request)
-        .map_err(|error| dispatch_error(&error))?;
-    let (parts, mut body) = response.into_parts();
-    let body = match body
-        .with_config()
-        .limit(client.max_response_bytes as u64)
-        .read_to_vec()
-    {
-        Ok(body) => body,
-        Err(ureq::Error::BodyExceedsLimit(_)) => return Err(Error::InvalidResponse),
-        Err(error) => return Err(dispatch_error(&error)),
-    };
+        .map_err(RequestFailure::Transport)?;
+    let (parts, body) = response.into_parts();
+    let limit = client.max_response_bytes;
+    let mut reader = body.into_reader();
+    let mut body = Vec::new();
+    reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| RequestFailure::Transport(ureq::Error::Io(error)))?;
+    if body.len() > limit {
+        return Err(RequestFailure::BodyLimit);
+    }
     Ok(RawResponse {
         status: parts.status.as_u16(),
         headers: parts.headers,
