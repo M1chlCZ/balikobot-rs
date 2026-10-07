@@ -1,7 +1,13 @@
 //! A Rust client for the Balikobot shipping API v2.
 
+pub mod client;
 pub mod codes;
+pub mod config;
 pub mod error;
+#[doc(hidden)]
+pub mod wire;
 
+pub use client::Client;
 pub use codes::{CarrierCode, CountryCode, CurrencyCode};
+pub use config::Config;
 pub use error::{Error, Result};
