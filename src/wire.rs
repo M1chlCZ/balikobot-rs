@@ -1,15 +1,22 @@
 //! The HTTP transport shared by the API methods.
 
+use std::cmp::Ordering;
+use std::fmt;
 use std::io::{self, Read};
 use std::time::Duration;
 
+use serde::Deserialize;
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
+use serde_json::value::RawValue;
 use ureq::http;
 use url::Url;
 
 use crate::Error;
 use crate::client::Client;
+use crate::codes::CountryCode;
 use crate::config::{host_is_loopback, host_with_port};
+use crate::models::Branch;
 
 const MAX_RETRY_AFTER_SECONDS: u64 = 3600;
 const LABEL_QUERY_ZPL: &str = "zpl=1";
@@ -180,6 +187,286 @@ fn label_scheme_allowed(url: &Url) -> bool {
         "http" => host_is_loopback(url),
         _ => false,
     }
+}
+
+const BRANCH_FIELD_LIMIT: usize = 200;
+const ZIP_LIMIT: usize = 16;
+
+/// The decoded body of a `BRANCHES` response.
+#[derive(Debug, Deserialize)]
+pub struct BranchesResponse {
+    /// The body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The decoded branch entries.
+    #[serde(default, deserialize_with = "deserialize_branch_list")]
+    pub branches: Vec<BranchWire>,
+}
+
+/// One provider branch entry before sanitizing.
+#[derive(Debug, Default, Deserialize)]
+pub struct BranchWire {
+    /// The provider branch type, for example "branch" or "box".
+    #[serde(rename = "type", default, deserialize_with = "deserialize_string")]
+    pub branch_type: String,
+    /// The primary branch identifier.
+    #[serde(
+        rename = "branch_id",
+        default,
+        deserialize_with = "deserialize_branch_id"
+    )]
+    pub branch_id: Option<String>,
+    /// The fallback branch identifier.
+    #[serde(default, deserialize_with = "deserialize_branch_id")]
+    pub id: Option<String>,
+    /// The display name.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub name: String,
+    /// The street part of the address.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub street: String,
+    /// The city part of the address.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub city: String,
+    /// The postal code.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub zip: String,
+    /// The ISO 3166-1 alpha-2 country code.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub country: String,
+    /// The `lat` GPS coordinate.
+    #[serde(default, deserialize_with = "deserialize_coordinate")]
+    pub lat: Option<f64>,
+    /// The `lng` GPS coordinate.
+    #[serde(default, deserialize_with = "deserialize_coordinate")]
+    pub lng: Option<f64>,
+    /// The `latitude` GPS coordinate.
+    #[serde(default, deserialize_with = "deserialize_coordinate")]
+    pub latitude: Option<f64>,
+    /// The `longitude` GPS coordinate.
+    #[serde(default, deserialize_with = "deserialize_coordinate")]
+    pub longitude: Option<f64>,
+}
+
+/// Decodes a `BRANCHES` response body.
+pub fn parse_branches(body: &[u8]) -> Option<BranchesResponse> {
+    serde_json::from_slice(body).ok()
+}
+
+/// Converts one parsed branch into the public model, or rejects it.
+pub fn sanitize_branch(wire: &BranchWire) -> Option<Branch> {
+    let id = wire.branch_id.as_ref().or(wire.id.as_ref()).cloned()?;
+    if !valid_branch_field(&wire.name, BRANCH_FIELD_LIMIT)
+        || !valid_branch_field(&wire.street, BRANCH_FIELD_LIMIT)
+        || !valid_branch_field(&wire.city, BRANCH_FIELD_LIMIT)
+        || !valid_branch_field(&wire.zip, ZIP_LIMIT)
+    {
+        return None;
+    }
+    let name = if wire.name.is_empty() {
+        wire.zip.clone()
+    } else {
+        wire.name.clone()
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let country = CountryCode::from_wire(wire.country.clone())?;
+    let (latitude, longitude) = branch_coordinates(wire);
+    Some(Branch {
+        id,
+        r#type: wire.branch_type.clone(),
+        name,
+        street: wire.street.clone(),
+        city: wire.city.clone(),
+        zip: wire.zip.clone(),
+        country,
+        latitude,
+        longitude,
+    })
+}
+
+/// Builds the `BRANCHES` path and reports whether the country must be filtered
+/// client-side.
+pub fn branches_path(
+    carrier: &crate::CarrierCode,
+    service: &str,
+    country: &CountryCode,
+) -> (String, bool) {
+    let path = format!("/{carrier}/branches/service/{service}");
+    match carrier.as_str() {
+        "ppl" | "dpd" | "dpdcz" | "dpdsk" | "geis" | "gls" | "intime" => {
+            (format!("{path}/country/{country}"), false)
+        }
+        "cp" | "ceskaposta" | "balikovna" => (format!("{path}/country/{country}"), true),
+        "zasilkovna" => (format!("/{carrier}/branches/country/{country}"), false),
+        "sp" | "ulozenka" => (path, true),
+        _ => (path, true),
+    }
+}
+
+fn deserialize_branch_list<'de, D>(deserializer: D) -> Result<Vec<BranchWire>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BranchListVisitor;
+
+    impl<'de> Visitor<'de> for BranchListVisitor {
+        type Value = Vec<BranchWire>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a branch list")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut branches = Vec::new();
+            while let Some(branch) = sequence.next_element()? {
+                branches.push(branch);
+            }
+            Ok(branches)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut entries = Vec::new();
+            while let Some((key, branch)) = map.next_entry::<String, BranchWire>()? {
+                entries.push((key, branch));
+            }
+            entries.sort_by(|left, right| compare_branch_keys(&left.0, &right.0));
+            Ok(entries.into_iter().map(|(_, branch)| branch).collect())
+        }
+    }
+
+    deserializer.deserialize_any(BranchListVisitor)
+}
+
+fn compare_branch_keys(left: &str, right: &str) -> Ordering {
+    match (left.parse::<i64>(), right.parse::<i64>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        (Ok(_), Err(_)) => Ordering::Less,
+        (Err(_), Ok(_)) => Ordering::Greater,
+        (Err(_), Err(_)) => left.cmp(right),
+    }
+}
+
+fn deserialize_status<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    let text = raw.get().trim();
+    if text.starts_with('"') {
+        let digits: String = serde_json::from_str(text)
+            .map_err(|_| serde::de::Error::custom("invalid Balíkobot response status"))?;
+        if digits.is_empty()
+            || digits.len() > 3
+            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(serde::de::Error::custom(
+                "invalid Balíkobot response status",
+            ));
+        }
+        return digits
+            .parse()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom("invalid Balíkobot response status"));
+    }
+    if text == "null" {
+        return Err(serde::de::Error::custom(
+            "invalid Balíkobot response status",
+        ));
+    }
+    text.parse()
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("invalid Balíkobot response status"))
+}
+
+fn deserialize_branch_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    let text = raw.get();
+    if text.starts_with('"') {
+        let value: String = serde_json::from_str(text)
+            .map_err(|_| serde::de::Error::custom("invalid Balíkobot branch id"))?;
+        return Ok(valid_branch_id(&value).then_some(value));
+    }
+    if text == "null" {
+        return Ok(None);
+    }
+    if text.contains(['.', 'e', 'E'])
+        || !text.starts_with(|first: char| first.is_ascii_digit() || first == '-')
+    {
+        return Err(serde::de::Error::custom("invalid Balíkobot branch id"));
+    }
+    Ok(valid_branch_id(text).then(|| text.to_owned()))
+}
+
+fn deserialize_coordinate<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Ok(raw) = Box::<RawValue>::deserialize(deserializer) else {
+        return Ok(None);
+    };
+    let text = raw.get();
+    let encoded: String = if text.starts_with('"') {
+        serde_json::from_str(text).unwrap_or_default()
+    } else {
+        text.to_owned()
+    };
+    Ok(encoded.trim().parse().ok())
+}
+
+fn deserialize_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn valid_branch_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_branch_field(value: &str, maximum: usize) -> bool {
+    value.chars().count() <= maximum && !value.contains(['\r', '\n', '\0'])
+}
+
+fn branch_coordinates(wire: &BranchWire) -> (Option<f64>, Option<f64>) {
+    for (latitude, longitude) in [(wire.lat, wire.lng), (wire.latitude, wire.longitude)] {
+        if let (Some(latitude), Some(longitude)) = (latitude, longitude)
+            && valid_coordinates(latitude, longitude)
+        {
+            return (Some(latitude), Some(longitude));
+        }
+    }
+    (None, None)
+}
+
+fn valid_coordinates(latitude: f64, longitude: f64) -> bool {
+    (-90.0..=90.0).contains(&latitude)
+        && (-180.0..=180.0).contains(&longitude)
+        && (latitude != 0.0 || longitude != 0.0)
 }
 
 #[cfg(test)]

@@ -3,12 +3,14 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ureq::Agent;
+use ureq::http;
 
 use crate::config::{
     API_KEY_LIMIT, Config, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_TIMEOUT, MAX_RESPONSE_BYTES_LIMIT,
     USER_LIMIT, normalize_label_hosts, resolve_base_url,
 };
-use crate::{Error, Result};
+use crate::wire::{self, RequestFailure};
+use crate::{Branch, CarrierCode, CountryCode, Error, Result};
 
 /// A Balíkobot API v2 client.
 pub struct Client {
@@ -75,4 +77,58 @@ impl Client {
             live_account: config.live_account,
         })
     }
+
+    /// Returns the branches of one carrier service in one country. The route
+    /// depends on the carrier: the selected carriers use the combined service
+    /// and country segments, Zásilkovna uses the country-only route, and the
+    /// remaining carriers use the service-only route with a client-side
+    /// country filter.
+    pub fn branches(
+        &self,
+        carrier: &CarrierCode,
+        service: &str,
+        country: &CountryCode,
+    ) -> Result<Vec<Branch>> {
+        if !carrier.is_valid() || !valid_service(service) || !country.is_valid() {
+            return Err(Error::InvalidRequest);
+        }
+        let (path, filter_country) = wire::branches_path(carrier, service, country);
+        let response =
+            wire::request(self, http::Method::GET, &path, None).map_err(
+                |failure| match failure {
+                    RequestFailure::Transport(_) | RequestFailure::BodyLimit => {
+                        Error::Unavailable { retry_after: None }
+                    }
+                },
+            )?;
+        if response.status == 429 || response.status >= 500 {
+            return Err(Error::Unavailable { retry_after: None });
+        }
+        if response.status != 200 || !wire::is_json(&response) {
+            return Err(Error::InvalidResponse);
+        }
+        let Some(parsed) = wire::parse_branches(&response.body) else {
+            return Err(Error::InvalidResponse);
+        };
+        match parsed.status {
+            Some(200) => {}
+            Some(426 | 503) => return Err(Error::Unavailable { retry_after: None }),
+            _ => return Err(Error::InvalidResponse),
+        }
+        let mut branches = Vec::with_capacity(parsed.branches.len());
+        for wire_branch in &parsed.branches {
+            let Some(branch) = wire::sanitize_branch(wire_branch) else {
+                continue;
+            };
+            if filter_country && !branch.country.as_str().is_empty() && branch.country != *country {
+                continue;
+            }
+            branches.push(branch);
+        }
+        Ok(branches)
+    }
+}
+
+fn valid_service(service: &str) -> bool {
+    (1..=16).contains(&service.len()) && service.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }

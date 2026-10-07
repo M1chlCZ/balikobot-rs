@@ -113,6 +113,12 @@ impl CountryCode {
         valid(&self.0)
     }
 
+    /// Builds a code from a wire value without normalization. An empty value
+    /// is kept, because a provider may omit the country of a domestic branch.
+    pub(crate) fn from_wire(value: String) -> Option<Self> {
+        (value.is_empty() || valid(&value)).then_some(Self(Cow::Owned(value)))
+    }
+
     /// Returns the wire value of the code.
     pub fn as_str(&self) -> &str {
         &self.0
