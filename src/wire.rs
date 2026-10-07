@@ -154,6 +154,40 @@ pub fn label_lookup_status(response: &RawResponse) -> crate::Result<()> {
     Ok(())
 }
 
+/// Classifies the HTTP answer of a `TRACKSTATUS` call before its body is
+/// decoded. A `4xx` answer other than 404 fails the whole account, so it is
+/// retryable instead of permanently rejected.
+pub fn track_http_status(response: &RawResponse) -> crate::Result<()> {
+    if response.status == 429 {
+        return Err(Error::Unavailable {
+            retry_after: retry_after(response),
+        });
+    }
+    if response.status >= 500 {
+        return Err(Error::Unavailable { retry_after: None });
+    }
+    if response.status == 404 {
+        return Err(Error::NotFound);
+    }
+    if response.status != 200 || !is_json(response) {
+        return Err(if (400..500).contains(&response.status) {
+            Error::Unavailable { retry_after: None }
+        } else {
+            Error::InvalidResponse
+        });
+    }
+    Ok(())
+}
+
+/// Maps an `ORDERPICKUP` provider status to the public error set. Every other
+/// status stays ambiguous, because the booking may have been accepted.
+pub fn pickup_status_error(status: u16) -> Error {
+    match status {
+        400 | 401 | 403 | 404 | 405 | 413 | 415 | 422 | 429 => Error::Rejected,
+        _ => Error::Ambiguous,
+    }
+}
+
 /// Reports whether a provider label URL is allowed for this client.
 pub fn valid_label_url(client: &Client, raw: &str) -> bool {
     let Ok(url) = Url::parse(raw) else {
@@ -220,7 +254,7 @@ fn label_scheme_allowed(url: &Url) -> bool {
     }
 }
 
-const BRANCH_FIELD_LIMIT: usize = 200;
+pub(crate) const BRANCH_FIELD_LIMIT: usize = 200;
 const ZIP_LIMIT: usize = 16;
 pub(crate) const IDENTIFIER_LIMIT: usize = 100;
 
@@ -425,6 +459,73 @@ pub struct OrderViewResponse {
     pub labels_url: String,
 }
 
+/// The decoded body of a `TRACKSTATUS` response.
+#[derive(Debug, Deserialize)]
+pub struct TrackStatusResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The decoded package entries.
+    #[serde(default, deserialize_with = "deserialize_lenient_list")]
+    pub packages: Vec<TrackStatusPackage>,
+}
+
+/// One per-package entry of a `TRACKSTATUS` response.
+#[derive(Debug, Default, Deserialize)]
+pub struct TrackStatusPackage {
+    /// The carrier tracking number.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub carrier_id: String,
+    /// The coarse provider status code.
+    #[serde(default, deserialize_with = "deserialize_track_status_id")]
+    pub status_id: Option<String>,
+    /// The detailed provider status code.
+    #[serde(default, deserialize_with = "deserialize_track_status_id")]
+    pub status_id_v2: Option<String>,
+    /// The provider status description.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub name: String,
+    /// The fallback provider status description.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub status_text: String,
+    /// The per-package provider status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+}
+
+/// The decoded body of an `ORDER` response.
+#[derive(Debug, Deserialize)]
+pub struct OrderResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The provider order reference.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub order_id: String,
+}
+
+/// The decoded body of a `DROP` response.
+#[derive(Debug, Deserialize)]
+pub struct DropResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+}
+
+/// The decoded body of an `ORDERPICKUP` response.
+#[derive(Debug, Deserialize)]
+pub struct PickupResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The provider pickup reference.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub pickup_order_id: String,
+    /// The provider confirmation, when the provider sent one.
+    #[serde(default)]
+    pub confirmed: Option<bool>,
+}
+
 /// Decodes an `ADD` response body.
 pub fn parse_add(body: &[u8]) -> Option<AddResponse> {
     parse_object(body)
@@ -442,6 +543,26 @@ pub fn parse_labels(body: &[u8]) -> Option<LabelsResponse> {
 
 /// Decodes an `ORDERV` response body.
 pub fn parse_order_view(body: &[u8]) -> Option<OrderViewResponse> {
+    parse_object(body)
+}
+
+/// Decodes a `TRACKSTATUS` response body.
+pub fn parse_track_status(body: &[u8]) -> Option<TrackStatusResponse> {
+    parse_object(body)
+}
+
+/// Decodes an `ORDER` response body.
+pub fn parse_order(body: &[u8]) -> Option<OrderResponse> {
+    parse_object(body)
+}
+
+/// Decodes a `DROP` response body.
+pub fn parse_drop(body: &[u8]) -> Option<DropResponse> {
+    parse_object(body)
+}
+
+/// Decodes an `ORDERPICKUP` response body.
+pub fn parse_pickup(body: &[u8]) -> Option<PickupResponse> {
     parse_object(body)
 }
 
@@ -539,6 +660,47 @@ where
     text.parse()
         .map(Some)
         .map_err(|_| serde::de::Error::custom("invalid Balíkobot response status"))
+}
+
+fn deserialize_track_status_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    let text = raw.get();
+    if !valid_track_status_id(text) {
+        return Err(serde::de::Error::custom(
+            "invalid Balíkobot track status id",
+        ));
+    }
+    Ok(Some(text.to_owned()))
+}
+
+fn valid_track_status_id(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    if bytes.first() == Some(&b'-') {
+        index += 1;
+    }
+    let digits_start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if !(1..=3).contains(&(index - digits_start)) {
+        return false;
+    }
+    if index == bytes.len() {
+        return true;
+    }
+    if bytes[index] != b'.' {
+        return false;
+    }
+    index += 1;
+    let fraction_start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    (1..=2).contains(&(index - fraction_start)) && index == bytes.len()
 }
 
 fn deserialize_branch_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>

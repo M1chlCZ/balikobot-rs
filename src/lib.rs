@@ -12,4 +12,7 @@ pub use client::{Client, resolve_branch_id};
 pub use codes::{CarrierCode, CountryCode, CurrencyCode};
 pub use config::Config;
 pub use error::{Error, Result};
-pub use models::{AddPackageRequest, AddPackageResult, Branch, OverviewPackage};
+pub use models::{
+    AddPackageRequest, AddPackageResult, Branch, OrderResult, OverviewPackage, PickupRequest,
+    PickupResult, TrackStatusResult,
+};

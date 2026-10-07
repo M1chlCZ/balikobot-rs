@@ -12,12 +12,18 @@ use crate::config::{
     API_KEY_LIMIT, Config, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_TIMEOUT, MAX_RESPONSE_BYTES_LIMIT,
     USER_LIMIT, normalize_label_hosts, resolve_base_url,
 };
-use crate::models::{AddPackageRequest, AddPackageResult, OverviewPackage};
+use crate::models::{
+    AddPackageRequest, AddPackageResult, OrderResult, OverviewPackage, PickupRequest, PickupResult,
+    TrackStatusResult,
+};
 use crate::wire::{self, RequestFailure};
 use crate::{Branch, CarrierCode, CountryCode, CurrencyCode, Error, Result};
 
 const ADD_FIELD_LIMIT: usize = 255;
 const LABEL_RESPONSE_LIMIT: usize = 4 << 20;
+const PICKUP_NOTE_LIMIT: usize = 255;
+const PICKUP_PACKAGE_LIMIT: i32 = 10_000;
+const PICKUP_WEIGHT_LIMIT: f64 = 100_000.0;
 const TRACK_REFERENCE_MODULUS: i64 = 10_000_000_000;
 const ZPL_MAGIC_PREFIX: &str = "^X";
 
@@ -220,6 +226,238 @@ impl Client {
             400 | 403 | 404 | 405 | 406 | 409 | 413 | 423 | 501 => Err(Error::Rejected),
             _ => Err(Error::Ambiguous),
         }
+    }
+
+    /// Calls the TRACKSTATUS method for one carrier tracking number and
+    /// returns the raw provider status. The documented response wraps
+    /// per-package entries in a `packages` array. A package entry or HTTP
+    /// answer with status 404 means that the carrier has no tracking data yet
+    /// and maps to [`Error::NotFound`].
+    pub fn track_status(
+        &self,
+        carrier: &CarrierCode,
+        carrier_id: &str,
+    ) -> Result<TrackStatusResult> {
+        if !carrier.is_valid() || !wire::valid_package_id(carrier_id) {
+            return Err(Error::InvalidRequest);
+        }
+        let body = json!({"carrier_ids": [carrier_id]});
+        let response = wire::request(
+            self,
+            http::Method::POST,
+            &format!("/{carrier}/trackstatus"),
+            Some(&body),
+        )
+        .map_err(|_| Error::Unavailable { retry_after: None })?;
+        wire::track_http_status(&response)?;
+        let Some(parsed) = wire::parse_track_status(&response.body) else {
+            return Err(Error::InvalidResponse);
+        };
+        if let Some(status) = parsed.status {
+            match status {
+                200 => {}
+                426 | 503 => return Err(Error::Unavailable { retry_after: None }),
+                404 => return Err(Error::NotFound),
+                _ => return Err(Error::InvalidResponse),
+            }
+        }
+        if parsed.packages.len() != 1 || parsed.packages[0].carrier_id != carrier_id {
+            return Err(Error::InvalidResponse);
+        }
+        let entry = &parsed.packages[0];
+        if entry.status.is_none() && (parsed.status.is_none() || entry.name.is_empty()) {
+            return Err(Error::InvalidResponse);
+        }
+        match entry.status.or(parsed.status).expect("one status is set") {
+            200 => {
+                let Some(id) = entry.status_id_v2.as_deref().or(entry.status_id.as_deref()) else {
+                    return Err(Error::InvalidResponse);
+                };
+                let description = if entry.name.is_empty() {
+                    &entry.status_text
+                } else {
+                    &entry.name
+                };
+                if description.is_empty()
+                    || !wire::valid_branch_field(description, wire::BRANCH_FIELD_LIMIT)
+                {
+                    return Err(Error::InvalidResponse);
+                }
+                Ok(TrackStatusResult {
+                    status_id: id.to_owned(),
+                    status_text: description.clone(),
+                })
+            }
+            404 => Err(Error::NotFound),
+            426 | 503 => Err(Error::Unavailable { retry_after: None }),
+            400 | 403 | 405 | 406 | 409 | 413 | 423 => Err(Error::Rejected),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
+
+    /// Calls the ORDER method, which hands one package over to the carrier
+    /// batch. ORDER is idempotent on `package_ids`: a repeated closure of the
+    /// same dataset returns status 208 with the original order id, so an
+    /// idempotent retry after an ambiguous answer replays the original record
+    /// instead of closing the package twice.
+    pub fn order_batch(&self, carrier: &CarrierCode, package_id: &str) -> Result<OrderResult> {
+        if !carrier.is_valid() || !wire::valid_package_id(package_id) {
+            return Err(Error::InvalidRequest);
+        }
+        let body = json!({"package_ids": [package_id]});
+        let response = wire::request(
+            self,
+            http::Method::POST,
+            &format!("/{carrier}/order"),
+            Some(&body),
+        )
+        .map_err(ambiguous_request_failure)?;
+        let status = response.status;
+        if status == 429 {
+            return Err(Error::Unavailable {
+                retry_after: wire::retry_after(&response),
+            });
+        }
+        if status >= 500 {
+            return Err(Error::Unavailable { retry_after: None });
+        }
+        if status != 200 || !wire::is_json(&response) {
+            return Err(if (200..300).contains(&status) {
+                Error::Ambiguous
+            } else if (400..500).contains(&status) {
+                Error::Rejected
+            } else {
+                Error::InvalidResponse
+            });
+        }
+        let Some(parsed) = wire::parse_order(&response.body) else {
+            return Err(Error::Ambiguous);
+        };
+        let Some(body_status) = parsed.status else {
+            return Err(Error::Ambiguous);
+        };
+        match body_status {
+            200 | 208 => {
+                if parsed.order_id.is_empty()
+                    || !wire::valid_branch_field(&parsed.order_id, wire::IDENTIFIER_LIMIT)
+                {
+                    return Err(Error::Ambiguous);
+                }
+                Ok(OrderResult {
+                    order_id: parsed.order_id.clone(),
+                })
+            }
+            426 | 503 => Err(Error::Unavailable { retry_after: None }),
+            400 | 402 | 403 | 404 | 405 | 406 | 409 | 413 | 423 => Err(Error::Rejected),
+            _ => Err(Error::Ambiguous),
+        }
+    }
+
+    /// Calls the DROP method for one package that has not entered ORDER. A
+    /// body status 404 means that the package is already gone and the call
+    /// succeeds. A body status 405 marks a package that was already handed to
+    /// the batch and maps to [`Error::Rejected`]. An ambiguous DROP answer
+    /// must be reconciled through OVERVIEW before any retry.
+    pub fn drop_package(&self, carrier: &CarrierCode, package_id: &str) -> Result<()> {
+        if !carrier.is_valid() || !wire::valid_package_id(package_id) {
+            return Err(Error::InvalidRequest);
+        }
+        let body = json!({"package_ids": [package_id]});
+        let response = wire::request(
+            self,
+            http::Method::POST,
+            &format!("/{carrier}/drop"),
+            Some(&body),
+        )
+        .map_err(ambiguous_request_failure)?;
+        let status = response.status;
+        if status == 429 {
+            return Err(Error::Unavailable {
+                retry_after: wire::retry_after(&response),
+            });
+        }
+        if status >= 500 {
+            return Err(Error::Unavailable { retry_after: None });
+        }
+        if status != 200 || !wire::is_json(&response) {
+            return Err(if (200..300).contains(&status) {
+                Error::Ambiguous
+            } else if (400..500).contains(&status) {
+                Error::Rejected
+            } else {
+                Error::InvalidResponse
+            });
+        }
+        let Some(parsed) = wire::parse_drop(&response.body) else {
+            return Err(Error::Ambiguous);
+        };
+        let Some(body_status) = parsed.status else {
+            return Err(Error::Ambiguous);
+        };
+        match body_status {
+            200 | 404 => Ok(()),
+            426 | 503 => Err(Error::Unavailable { retry_after: None }),
+            400 | 402 | 403 | 405 | 406 | 409 | 413 | 423 => Err(Error::Rejected),
+            _ => Err(Error::Ambiguous),
+        }
+    }
+
+    /// Calls the ORDERPICKUP method and books one physical collection,
+    /// separately from the shipment data handover performed by ORDER. The
+    /// call performs exactly one HTTP attempt. DPD and DPDCZ take the
+    /// collection address from the carrier configuration; PPL also defaults
+    /// its contact information to that configuration.
+    pub fn order_pickup(
+        &self,
+        carrier: &CarrierCode,
+        request: &PickupRequest,
+    ) -> Result<PickupResult> {
+        if !valid_pickup_request(carrier, request) {
+            return Err(Error::Rejected);
+        }
+        let body = pickup_body(carrier, request);
+        let response = wire::request(
+            self,
+            http::Method::POST,
+            &format!("/{carrier}/orderpickup"),
+            Some(&body),
+        )
+        .map_err(|_| Error::Ambiguous)?;
+        if response.status != 200 {
+            return Err(wire::pickup_status_error(response.status));
+        }
+        if !wire::is_json(&response) {
+            return Err(Error::Ambiguous);
+        }
+        let Some(parsed) = wire::parse_pickup(&response.body) else {
+            return Err(Error::Ambiguous);
+        };
+        let Some(body_status) = parsed.status else {
+            return Err(Error::Ambiguous);
+        };
+        if body_status != 200 {
+            return Err(u16::try_from(body_status)
+                .map(wire::pickup_status_error)
+                .unwrap_or(Error::Ambiguous));
+        }
+        if *carrier != CarrierCode::PPL {
+            return Ok(PickupResult {
+                provider_id: String::new(),
+                confirmed: true,
+            });
+        }
+        let Some(confirmed) = parsed.confirmed else {
+            return Err(Error::Ambiguous);
+        };
+        if parsed.pickup_order_id.is_empty()
+            || !wire::valid_branch_field(&parsed.pickup_order_id, wire::IDENTIFIER_LIMIT)
+        {
+            return Err(Error::Ambiguous);
+        }
+        Ok(PickupResult {
+            provider_id: parsed.pickup_order_id.clone(),
+            confirmed,
+        })
     }
 
     /// Calls the OVERVIEW method, which lists the packages of a carrier that
@@ -439,6 +677,66 @@ fn ambiguous_request_failure(failure: RequestFailure) -> Error {
         RequestFailure::BodyLimit => Error::Ambiguous,
         failure => failure.into(),
     }
+}
+
+fn valid_pickup_request(carrier: &CarrierCode, request: &PickupRequest) -> bool {
+    if *carrier != CarrierCode::DPDCZ
+        && *carrier != CarrierCode::DPD
+        && *carrier != CarrierCode::PPL
+    {
+        return false;
+    }
+    valid_pickup_date(&request.date)
+        && request.package_count > 0
+        && request.package_count <= PICKUP_PACKAGE_LIMIT
+        && request.weight_kg > 0.0
+        && request.weight_kg <= PICKUP_WEIGHT_LIMIT
+        && !request.weight_kg.is_nan()
+        && wire::valid_branch_field(&request.note, PICKUP_NOTE_LIMIT)
+}
+
+fn valid_pickup_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let year = value[0..4].parse::<u32>().expect("four digits");
+    let month = value[5..7].parse::<u32>().expect("two digits");
+    let day = value[8..10].parse::<u32>().expect("two digits");
+    if !(1..=12).contains(&month) {
+        return false;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days).contains(&day)
+}
+
+fn pickup_body(carrier: &CarrierCode, request: &PickupRequest) -> serde_json::Value {
+    let mut body = json!({"date": request.date});
+    if *carrier == CarrierCode::PPL {
+        if !request.note.is_empty() {
+            body["note"] = json!(request.note);
+        }
+    } else {
+        body["weight"] = json!(request.weight_kg);
+        body["package_count"] = json!(request.package_count);
+        if !request.note.is_empty() {
+            body["message"] = json!(request.note);
+        }
+    }
+    body
 }
 
 fn sanitize_overview_entry(
