@@ -126,6 +126,35 @@ fn nameless_branch_falls_back_to_zip_and_country_filter_applies() {
 }
 
 #[test]
+fn null_branch_entries_are_skipped() {
+    let body = br#"{
+        "status": 200,
+        "branches": [
+            null,
+            {"id": "1", "name": "Praha", "zip": "11000"},
+            null
+        ]
+    }"#;
+    let server = json_serve("200 OK", body);
+    let client = loopback_client(server.port);
+    let branches = client
+        .branches(&CarrierCode::PPL, "1", &CountryCode::CZ)
+        .expect("branches");
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].id, "1");
+}
+
+#[test]
+fn top_level_array_is_invalid_response() {
+    let server = json_serve("200 OK", b"[200]");
+    let client = loopback_client(server.port);
+    let error = client
+        .branches(&CarrierCode::PPL, "1", &CountryCode::CZ)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidResponse));
+}
+
+#[test]
 fn server_error_returns_unavailable() {
     let server = serve("500 Internal Server Error", &[], b"");
     let client = loopback_client(server.port);

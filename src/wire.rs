@@ -248,8 +248,12 @@ pub struct BranchWire {
     pub longitude: Option<f64>,
 }
 
-/// Decodes a `BRANCHES` response body.
+/// Decodes a `BRANCHES` response body. The top-level body must be a JSON
+/// object; arrays, scalars, and `null` are rejected.
 pub fn parse_branches(body: &[u8]) -> Option<BranchesResponse> {
+    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
     serde_json::from_slice(body).ok()
 }
 
@@ -331,8 +335,8 @@ where
             A: SeqAccess<'de>,
         {
             let mut branches = Vec::new();
-            while let Some(branch) = sequence.next_element()? {
-                branches.push(branch);
+            while let Some(entry) = sequence.next_element::<Option<BranchWire>>()? {
+                branches.push(entry.unwrap_or_default());
             }
             Ok(branches)
         }
@@ -342,8 +346,8 @@ where
             A: MapAccess<'de>,
         {
             let mut entries = Vec::new();
-            while let Some((key, branch)) = map.next_entry::<String, BranchWire>()? {
-                entries.push((key, branch));
+            while let Some((key, entry)) = map.next_entry::<String, Option<BranchWire>>()? {
+                entries.push((key, entry.unwrap_or_default()));
             }
             entries.sort_by(|left, right| compare_branch_keys(&left.0, &right.0));
             Ok(entries.into_iter().map(|(_, branch)| branch).collect())
