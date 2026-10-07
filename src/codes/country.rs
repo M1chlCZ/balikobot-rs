@@ -123,6 +123,12 @@ impl CountryCode {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Builds a code from a provider capability answer without validating it.
+    /// The value is trimmed and upper-cased.
+    pub(crate) fn from_capability(value: &str) -> Self {
+        Self(Cow::Owned(value.trim().to_ascii_uppercase()))
+    }
 }
 
 fn valid(value: &str) -> bool {

@@ -1,6 +1,7 @@
 //! The HTTP transport shared by the API methods.
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Read};
 use std::time::Duration;
@@ -14,9 +15,9 @@ use url::Url;
 
 use crate::Error;
 use crate::client::Client;
-use crate::codes::CountryCode;
+use crate::codes::{CountryCode, CurrencyCode};
 use crate::config::{host_is_loopback, host_with_port};
-use crate::models::Branch;
+use crate::models::{Branch, CODCapability, Carrier, Service};
 
 const MAX_RETRY_AFTER_SECONDS: u64 = 3600;
 const LABEL_QUERY_ZPL: &str = "zpl=1";
@@ -40,6 +41,8 @@ pub enum RequestFailure {
     Transport(ureq::Error),
     /// The decoded response body exceeds the configured limit.
     BodyLimit,
+    /// The account mode could not be verified before the write.
+    AccountUnverified,
 }
 
 impl From<RequestFailure> for Error {
@@ -47,6 +50,7 @@ impl From<RequestFailure> for Error {
         match failure {
             RequestFailure::Transport(error) => dispatch_error(&error),
             RequestFailure::BodyLimit => Error::InvalidResponse,
+            RequestFailure::AccountUnverified => Error::Unavailable { retry_after: None },
         }
     }
 }
@@ -58,6 +62,11 @@ pub fn request(
     path: &str,
     body: Option<&Value>,
 ) -> Result<RawResponse, RequestFailure> {
+    if method != http::Method::GET {
+        client
+            .verify_write_allowed()
+            .map_err(|_| RequestFailure::AccountUnverified)?;
+    }
     let url = format!("{}/{}", client.base_url, path.trim_start_matches('/'));
     let mut builder = http::Request::builder()
         .method(method)
@@ -838,6 +847,585 @@ fn valid_coordinates(latitude: f64, longitude: f64) -> bool {
         && (latitude != 0.0 || longitude != 0.0)
 }
 
+pub(crate) const CAPABILITY_CARRIER_LIMIT: usize = 128;
+pub(crate) const CAPABILITY_SERVICE_LIMIT: usize = 512;
+const CAPABILITY_NAME_LIMIT: usize = 512;
+const DECIMAL_EXPONENT_LIMIT: i64 = 64;
+const PRICE_TEXT_LIMIT: usize = 64;
+const SERVICE_CODE_LIMIT: usize = 64;
+
+/// A provider answer that carries a top-level body status.
+pub(crate) trait CapabilityStatus {
+    /// Returns the body status, when the provider sent a valid one.
+    fn status_value(&self) -> Option<i64>;
+}
+
+/// The decoded body of a `WHOAMI` response.
+#[derive(Debug, Default, Deserialize)]
+pub struct WhoAmIWire {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The live account flag, when the provider sent one.
+    #[serde(default)]
+    pub live_account: Option<bool>,
+    /// The contracted carriers.
+    #[serde(default, deserialize_with = "deserialize_lenient_list")]
+    pub carriers: Vec<CapabilityCarrierWire>,
+}
+
+impl CapabilityStatus for WhoAmIWire {
+    fn status_value(&self) -> Option<i64> {
+        self.status
+    }
+}
+
+/// One contracted carrier entry of a `WHOAMI` response.
+#[derive(Debug, Default, Deserialize)]
+pub struct CapabilityCarrierWire {
+    /// The carrier code used in request paths.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub slug: String,
+    /// The carrier display name.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub name: String,
+}
+
+/// The decoded body of an `ACTIVATEDSERVICES` response.
+#[derive(Debug, Default, Deserialize)]
+pub struct ActivatedServicesResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The active parcel shipping flag, when the provider sent one.
+    #[serde(default)]
+    pub active_parcel: Option<bool>,
+    /// The activated service entries.
+    #[serde(default, deserialize_with = "deserialize_lenient_list")]
+    pub service_types: Vec<ActivatedServiceWire>,
+}
+
+impl CapabilityStatus for ActivatedServicesResponse {
+    fn status_value(&self) -> Option<i64> {
+        self.status
+    }
+}
+
+/// One activated service entry before normalizing.
+#[derive(Debug, Default, Deserialize)]
+pub struct ActivatedServiceWire {
+    /// The provider service code.
+    #[serde(default, deserialize_with = "deserialize_service_code")]
+    pub service_type: Option<String>,
+    /// The provider service name.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub name: String,
+    /// The home delivery flag.
+    #[serde(default)]
+    pub home_delivery: Option<bool>,
+    /// The box delivery flag.
+    #[serde(default)]
+    pub box_delivery: Option<bool>,
+    /// The pickup point delivery flag.
+    #[serde(default)]
+    pub pickup_points_delivery: Option<bool>,
+}
+
+/// The decoded body of a `COUNTRIES4SERVICE` response.
+#[derive(Debug, Default, Deserialize)]
+pub struct CountriesResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The service country entries.
+    #[serde(default, deserialize_with = "countries_service_types")]
+    pub service_types: Vec<CountriesServiceWire>,
+}
+
+impl CapabilityStatus for CountriesResponse {
+    fn status_value(&self) -> Option<i64> {
+        self.status
+    }
+}
+
+/// One service country entry before normalizing.
+#[derive(Debug, Default, Deserialize)]
+pub struct CountriesServiceWire {
+    /// The provider service code.
+    #[serde(default, deserialize_with = "deserialize_service_code")]
+    pub service_type: Option<String>,
+    /// The destination country codes.
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub countries: Vec<String>,
+}
+
+/// The decoded body of a `COD4SERVICES` response.
+#[derive(Debug, Default, Deserialize)]
+pub struct CodResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The service cash-on-delivery entries.
+    #[serde(default, deserialize_with = "deserialize_lenient_list")]
+    pub service_types: Vec<CodServiceWire>,
+}
+
+impl CapabilityStatus for CodResponse {
+    fn status_value(&self) -> Option<i64> {
+        self.status
+    }
+}
+
+/// One cash-on-delivery service entry before normalizing.
+#[derive(Debug, Default, Deserialize)]
+pub struct CodServiceWire {
+    /// The provider service code.
+    #[serde(default, deserialize_with = "deserialize_service_code")]
+    pub service_type: Option<String>,
+    /// The cash-on-delivery country entries.
+    #[serde(default, deserialize_with = "deserialize_lenient_list")]
+    pub countries: Vec<CodCountryWire>,
+}
+
+/// One cash-on-delivery country entry before normalizing.
+#[derive(Debug, Default, Deserialize)]
+pub struct CodCountryWire {
+    /// The destination country code.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub country: String,
+    /// The currency code.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub currency: String,
+    /// The unparsed maximum price.
+    #[serde(default)]
+    pub max_price: Option<Box<RawValue>>,
+}
+
+/// Normalizes the activated service entries of one carrier and returns them
+/// with a lookup by service code.
+pub(crate) fn normalize_activated_services(
+    activated: &ActivatedServicesResponse,
+) -> crate::Result<(Vec<Service>, HashMap<String, usize>)> {
+    if activated.service_types.len() > CAPABILITY_SERVICE_LIMIT {
+        return Err(Error::InvalidResponse);
+    }
+    let mut services = Vec::with_capacity(activated.service_types.len());
+    let mut index = HashMap::with_capacity(activated.service_types.len());
+    for entry in &activated.service_types {
+        let service = normalize_activated_service(entry)?;
+        if activated.active_parcel == Some(false) {
+            continue;
+        }
+        if let Some(previous) = index.get(&service.code) {
+            if !same_service(&services[*previous], &service) {
+                return Err(Error::InvalidResponse);
+            }
+            continue;
+        }
+        index.insert(service.code.clone(), services.len());
+        services.push(service);
+    }
+    Ok((services, index))
+}
+
+/// Merges the activated services, the supported countries and the optional
+/// cash-on-delivery dictionary into the combined capability answer.
+pub(crate) fn normalize_capabilities(
+    activated: &ActivatedServicesResponse,
+    countries: &CountriesResponse,
+    cod: &CodResponse,
+) -> crate::Result<Vec<Service>> {
+    let (mut services, index) = normalize_activated_services(activated)?;
+    merge_capability_countries(&mut services, &index, countries)?;
+    merge_capability_cod(&mut services, &index, cod)?;
+    Ok(services)
+}
+
+/// Selects the contracted carriers to discover. Without a scope every
+/// contracted carrier is selected; an empty scope selects none. A requested
+/// carrier that is not contracted fails the call.
+pub(crate) fn scoped_capability_carriers(
+    contracted: &[CapabilityCarrierWire],
+    scope: Option<&[crate::CarrierCode]>,
+) -> crate::Result<Vec<Carrier>> {
+    if contracted.len() > CAPABILITY_CARRIER_LIMIT {
+        return Err(Error::InvalidResponse);
+    }
+    let mut available = HashMap::with_capacity(contracted.len());
+    for entry in contracted {
+        let code = crate::CarrierCode::new(&entry.slug).map_err(|_| Error::InvalidResponse)?;
+        available.insert(code, true);
+    }
+    let mut requested = available.clone();
+    if let Some(scope) = scope {
+        requested = HashMap::with_capacity(scope.len());
+        for candidate in scope {
+            let code =
+                crate::CarrierCode::new(candidate.as_str()).map_err(|_| Error::InvalidResponse)?;
+            if !available.contains_key(&code) {
+                return Err(Error::InvalidResponse);
+            }
+            requested.insert(code, true);
+        }
+    }
+    let mut carriers = Vec::with_capacity(requested.len());
+    for entry in contracted {
+        let code = crate::CarrierCode::new(&entry.slug).map_err(|_| Error::InvalidResponse)?;
+        if requested.remove(&code).is_some() {
+            carriers.push(Carrier {
+                carrier_code: code,
+                services: Vec::new(),
+            });
+        }
+    }
+    Ok(carriers)
+}
+
+/// Normalizes the cash-on-delivery destinations of one service. Every country
+/// sent by the provider is kept.
+pub(crate) fn normalize_cod_countries(
+    countries: &[CodCountryWire],
+) -> crate::Result<Vec<CODCapability>> {
+    let mut entries = Vec::with_capacity(countries.len());
+    for entry in countries {
+        let capability = normalize_cod_capability(entry)?;
+        if let Some(existing) =
+            find_cod_capability(&entries, &capability.country, &capability.currency)
+        {
+            if *existing != capability {
+                return Err(Error::InvalidResponse);
+            }
+            continue;
+        }
+        entries.push(capability);
+    }
+    Ok(entries)
+}
+
+fn normalize_activated_service(entry: &ActivatedServiceWire) -> crate::Result<Service> {
+    let raw_code = entry
+        .service_type
+        .as_deref()
+        .ok_or(Error::InvalidResponse)?;
+    let code = raw_code.trim();
+    let name = entry.name.trim();
+    if !valid_capability_service_code(code)
+        || name.is_empty()
+        || name.chars().count() > CAPABILITY_NAME_LIMIT
+        || name.chars().any(char::is_control)
+    {
+        return Err(Error::InvalidResponse);
+    }
+    Ok(Service {
+        code: code.to_owned(),
+        name: name.to_owned(),
+        home_delivery: entry.home_delivery,
+        box_delivery: entry.box_delivery,
+        pickup_points_delivery: entry.pickup_points_delivery,
+        countries: HashMap::new(),
+        cod: Vec::new(),
+    })
+}
+
+/// Reports whether a provider service code is usable for the capability
+/// answers.
+pub(crate) fn valid_capability_service_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.chars().count() <= CAPABILITY_SERVICE_LIMIT
+        && !code.contains(['/', '\\', '\0', '\r', '\n'])
+        && !code.chars().any(char::is_control)
+}
+
+fn same_service(left: &Service, right: &Service) -> bool {
+    left.code == right.code
+        && left.name == right.name
+        && left.home_delivery == right.home_delivery
+        && left.box_delivery == right.box_delivery
+        && left.pickup_points_delivery == right.pickup_points_delivery
+}
+
+fn merge_capability_countries(
+    services: &mut [Service],
+    index: &HashMap<String, usize>,
+    countries: &CountriesResponse,
+) -> crate::Result<()> {
+    if countries.service_types.len() > CAPABILITY_SERVICE_LIMIT {
+        return Err(Error::InvalidResponse);
+    }
+    for entry in &countries.service_types {
+        let raw_code = entry
+            .service_type
+            .as_deref()
+            .ok_or(Error::InvalidResponse)?;
+        let code = raw_code.trim();
+        if !valid_capability_service_code(code) || entry.countries.len() > CAPABILITY_SERVICE_LIMIT
+        {
+            return Err(Error::InvalidResponse);
+        }
+        let Some(service_index) = index.get(code) else {
+            continue;
+        };
+        for raw_country in &entry.countries {
+            let country = CountryCode::from_capability(raw_country);
+            if is_eu_country_code(&country) {
+                services[*service_index].countries.insert(country, true);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_capability_cod(
+    services: &mut [Service],
+    index: &HashMap<String, usize>,
+    cod: &CodResponse,
+) -> crate::Result<()> {
+    if cod.service_types.len() > CAPABILITY_SERVICE_LIMIT {
+        return Err(Error::InvalidResponse);
+    }
+    for entry in &cod.service_types {
+        let raw_code = entry
+            .service_type
+            .as_deref()
+            .ok_or(Error::InvalidResponse)?;
+        let code = raw_code.trim();
+        if !valid_capability_service_code(code) || entry.countries.len() > CAPABILITY_SERVICE_LIMIT
+        {
+            return Err(Error::InvalidResponse);
+        }
+        let Some(service_index) = index.get(code) else {
+            continue;
+        };
+        let merged = merge_cod_countries(&services[*service_index].cod, &entry.countries)?;
+        services[*service_index].cod = merged;
+    }
+    Ok(())
+}
+
+fn merge_cod_countries(
+    entries: &[CODCapability],
+    countries: &[CodCountryWire],
+) -> crate::Result<Vec<CODCapability>> {
+    let mut merged = entries.to_vec();
+    for entry in countries {
+        let capability = normalize_cod_capability(entry)?;
+        if !is_eu_country_code(&capability.country) {
+            continue;
+        }
+        if let Some(existing) =
+            find_cod_capability(&merged, &capability.country, &capability.currency)
+        {
+            if *existing != capability {
+                return Err(Error::InvalidResponse);
+            }
+            continue;
+        }
+        merged.push(capability);
+    }
+    Ok(merged)
+}
+
+fn find_cod_capability<'a>(
+    entries: &'a [CODCapability],
+    country: &CountryCode,
+    currency: &CurrencyCode,
+) -> Option<&'a CODCapability> {
+    entries
+        .iter()
+        .find(|entry| entry.country == *country && entry.currency == *currency)
+}
+
+fn normalize_cod_capability(entry: &CodCountryWire) -> crate::Result<CODCapability> {
+    let country = CountryCode::new(&entry.country).map_err(|_| Error::InvalidResponse)?;
+    let currency = CurrencyCode::new(&entry.currency).map_err(|_| Error::InvalidResponse)?;
+    let max_amount_minor = entry
+        .max_price
+        .as_deref()
+        .and_then(major_price_to_minor)
+        .ok_or(Error::InvalidResponse)?;
+    Ok(CODCapability {
+        country,
+        currency,
+        max_amount_minor,
+    })
+}
+
+/// Converts a major-unit price text into minor units without floats.
+fn major_price_to_minor(raw: &RawValue) -> Option<i64> {
+    let text = raw.get().trim();
+    if text.is_empty() || text.len() > PRICE_TEXT_LIMIT {
+        return None;
+    }
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(index) => {
+            let exponent = text[index + 1..].parse::<i64>().ok()?;
+            if !(-DECIMAL_EXPONENT_LIMIT..=DECIMAL_EXPONENT_LIMIT).contains(&exponent) {
+                return None;
+            }
+            (&text[..index], exponent)
+        }
+        None => (text, 0),
+    };
+    let (negative, unsigned) = match mantissa.strip_prefix('-') {
+        Some(unsigned) => (true, unsigned),
+        None => (false, mantissa.strip_prefix('+').unwrap_or(mantissa)),
+    };
+    let (integer, fraction) = match unsigned.split_once('.') {
+        Some((integer, fraction)) => (integer, fraction),
+        None => (unsigned, ""),
+    };
+    if (integer.is_empty() && fraction.is_empty())
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    if integer
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|byte| byte == b'0')
+    {
+        return Some(0);
+    }
+    if negative {
+        return None;
+    }
+    let mut digits = String::with_capacity(integer.len() + fraction.len());
+    digits.push_str(integer);
+    digits.push_str(fraction);
+    let mut scale = exponent + 2 - i64::try_from(fraction.len()).ok()?;
+    if scale < 0 {
+        let need = usize::try_from(-scale).ok()?;
+        if need > digits.len()
+            || !digits[digits.len() - need..]
+                .bytes()
+                .all(|byte| byte == b'0')
+        {
+            return None;
+        }
+        digits.truncate(digits.len() - need);
+        scale = 0;
+    }
+    let mut value: i128 = 0;
+    for byte in digits.bytes() {
+        value = value
+            .checked_mul(10)?
+            .checked_add(i128::from(byte - b'0'))?;
+    }
+    if scale > 0 {
+        value = value.checked_mul(10i128.checked_pow(u32::try_from(scale).ok()?)?)?;
+    }
+    i64::try_from(value).ok()
+}
+
+fn is_eu_country_code(code: &CountryCode) -> bool {
+    matches!(
+        code.as_str(),
+        "AT" | "BE"
+            | "BG"
+            | "HR"
+            | "CY"
+            | "CZ"
+            | "DK"
+            | "EE"
+            | "FI"
+            | "FR"
+            | "DE"
+            | "GR"
+            | "HU"
+            | "IE"
+            | "IT"
+            | "LV"
+            | "LT"
+            | "LU"
+            | "MT"
+            | "NL"
+            | "PL"
+            | "PT"
+            | "RO"
+            | "SK"
+            | "SI"
+            | "ES"
+            | "SE"
+    )
+}
+
+fn deserialize_service_code<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    let text = raw.get();
+    if text.starts_with('"') {
+        let value: String = serde_json::from_str(text)
+            .map_err(|_| serde::de::Error::custom("invalid Balíkobot service code"))?;
+        if !valid_service_code(&value) {
+            return Err(serde::de::Error::custom("invalid Balíkobot service code"));
+        }
+        return Ok(Some(value));
+    }
+    if text.starts_with(|first: char| first.is_ascii_digit() || first == '-')
+        && !text.contains(['.', 'e', 'E'])
+        && valid_service_code(text)
+    {
+        return Ok(Some(text.to_owned()));
+    }
+    Err(serde::de::Error::custom("invalid Balíkobot service code"))
+}
+
+fn valid_service_code(value: &str) -> bool {
+    !value.is_empty() && value.len() <= SERVICE_CODE_LIMIT && !value.contains(['\r', '\n', '\0'])
+}
+
+fn countries_service_types<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<CountriesServiceWire>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    let text = raw.get().trim();
+    if text == "null" {
+        return Ok(Vec::new());
+    }
+    if text.starts_with('[') {
+        let services: Vec<CountriesServiceWire> = serde_json::from_str(text)
+            .map_err(|_| serde::de::Error::custom("invalid Balíkobot countries answer"))?;
+        if services.len() > CAPABILITY_SERVICE_LIMIT {
+            return Err(serde::de::Error::custom(
+                "invalid Balíkobot countries answer",
+            ));
+        }
+        return Ok(services);
+    }
+    if !text.starts_with('{') {
+        return Err(serde::de::Error::custom(
+            "invalid Balíkobot countries answer",
+        ));
+    }
+    let keyed: BTreeMap<String, CountriesServiceWire> = serde_json::from_str(text)
+        .map_err(|_| serde::de::Error::custom("invalid Balíkobot countries answer"))?;
+    if keyed.len() > CAPABILITY_SERVICE_LIMIT
+        || keyed
+            .keys()
+            .any(|key| key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(serde::de::Error::custom(
+            "invalid Balíkobot countries answer",
+        ));
+    }
+    Ok(keyed.into_values().collect())
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,6 +1497,25 @@ mod tests {
             &client,
             "https://pdf.balikobot.cz/label.pdf#f"
         ));
+    }
+
+    #[test]
+    fn major_price_converts_to_minor_units_without_floats() {
+        let raw = |text: &str| RawValue::from_string(text.to_owned()).expect("raw");
+        for rejected in [
+            "1e999999999",
+            "1e-999999999",
+            "1.001",
+            "-1",
+            "\"NaN\"",
+            "\"1\"",
+        ] {
+            assert_eq!(major_price_to_minor(&raw(rejected)), None, "{rejected}");
+        }
+        assert_eq!(major_price_to_minor(&raw("1499.95")), Some(149995));
+        assert_eq!(major_price_to_minor(&raw(" 12 ")), Some(1200));
+        assert_eq!(major_price_to_minor(&raw("0.01")), Some(1));
+        assert_eq!(major_price_to_minor(&raw("1e2")), Some(10000));
     }
 
     #[test]

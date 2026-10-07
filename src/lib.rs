@@ -13,6 +13,7 @@ pub use codes::{CarrierCode, CountryCode, CurrencyCode};
 pub use config::Config;
 pub use error::{Error, Result};
 pub use models::{
-    AddPackageRequest, AddPackageResult, Branch, OrderResult, OverviewPackage, PickupRequest,
-    PickupResult, TrackStatusResult,
+    ActivatedServices, AddPackageRequest, AddPackageResult, Branch, CODCapability, Carrier,
+    OrderResult, OverviewPackage, PickupRequest, PickupResult, Service, ServiceCOD,
+    ServiceCountries, TrackStatusResult, WhoAmI, WhoAmICarrier,
 };

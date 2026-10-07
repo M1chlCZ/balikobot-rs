@@ -61,6 +61,12 @@ impl CarrierCode {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Builds a code from a provider capability answer without normalizing
+    /// or validating it.
+    pub(crate) fn from_capability(value: &str) -> Self {
+        Self(Cow::Owned(value.to_owned()))
+    }
 }
 
 fn valid(value: &str) -> bool {

@@ -1,6 +1,8 @@
 //! The API client and its configuration validation.
 
 use std::io::Read;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -13,12 +15,14 @@ use crate::config::{
     USER_LIMIT, normalize_label_hosts, resolve_base_url,
 };
 use crate::models::{
-    AddPackageRequest, AddPackageResult, OrderResult, OverviewPackage, PickupRequest, PickupResult,
-    TrackStatusResult,
+    ActivatedServices, AddPackageRequest, AddPackageResult, Carrier, OrderResult, OverviewPackage,
+    PickupRequest, PickupResult, ServiceCOD, ServiceCountries, TrackStatusResult, WhoAmI,
+    WhoAmICarrier,
 };
 use crate::wire::{self, RequestFailure};
 use crate::{Branch, CarrierCode, CountryCode, CurrencyCode, Error, Result};
 
+const ACCOUNT_MODE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const ADD_FIELD_LIMIT: usize = 255;
 const LABEL_RESPONSE_LIMIT: usize = 4 << 20;
 const PICKUP_NOTE_LIMIT: usize = 255;
@@ -26,6 +30,10 @@ const PICKUP_PACKAGE_LIMIT: i32 = 10_000;
 const PICKUP_WEIGHT_LIMIT: f64 = 100_000.0;
 const TRACK_REFERENCE_MODULUS: i64 = 10_000_000_000;
 const ZPL_MAGIC_PREFIX: &str = "^X";
+
+struct AccountState {
+    verified_at: Option<Instant>,
+}
 
 /// A Balíkobot API v2 client.
 pub struct Client {
@@ -36,8 +44,8 @@ pub struct Client {
     pub(crate) loopback: bool,
     pub(crate) max_response_bytes: usize,
     pub(crate) label_hosts: Vec<String>,
-    #[allow(dead_code)]
     pub(crate) live_account: Option<bool>,
+    account_state: Mutex<AccountState>,
 }
 
 impl Client {
@@ -90,7 +98,156 @@ impl Client {
             max_response_bytes,
             label_hosts,
             live_account: config.live_account,
+            account_state: Mutex::new(AccountState { verified_at: None }),
         })
+    }
+
+    /// Calls the WHOAMI method and returns the account information.
+    pub fn who_am_i(&self) -> Result<WhoAmI> {
+        let answer = self
+            .capability_get::<wire::WhoAmIWire>("/info/whoami", false)?
+            .ok_or(Error::InvalidResponse)?;
+        let carriers = answer
+            .carriers
+            .iter()
+            .map(|entry| WhoAmICarrier {
+                slug: CarrierCode::from_capability(&entry.slug),
+                name: entry.name.clone(),
+            })
+            .collect();
+        Ok(WhoAmI {
+            status: answer.status.ok_or(Error::InvalidResponse)?,
+            live_account: answer.live_account,
+            carriers,
+        })
+    }
+
+    /// Calls the ACTIVATEDSERVICES method of one carrier and returns the
+    /// normalized activated services. When the provider reports that parcel
+    /// shipping is inactive, the service list is empty.
+    pub fn activated_services(&self, carrier: &CarrierCode) -> Result<ActivatedServices> {
+        if !carrier.is_valid() {
+            return Err(Error::InvalidRequest);
+        }
+        let answer = self
+            .capability_get::<wire::ActivatedServicesResponse>(
+                &format!("/{carrier}/activatedservices"),
+                false,
+            )?
+            .ok_or(Error::InvalidResponse)?;
+        let (services, _) = wire::normalize_activated_services(&answer)?;
+        Ok(ActivatedServices {
+            active_parcel: answer.active_parcel,
+            services,
+        })
+    }
+
+    /// Calls the COUNTRIES4SERVICE method of one carrier and returns the
+    /// supported destination countries per service. Every country sent by
+    /// the provider is kept.
+    pub fn countries(&self, carrier: &CarrierCode) -> Result<Vec<ServiceCountries>> {
+        if !carrier.is_valid() {
+            return Err(Error::InvalidRequest);
+        }
+        let answer = self
+            .capability_get::<wire::CountriesResponse>(
+                &format!("/{carrier}/countries4service"),
+                false,
+            )?
+            .ok_or(Error::InvalidResponse)?;
+        if answer.service_types.len() > wire::CAPABILITY_SERVICE_LIMIT {
+            return Err(Error::InvalidResponse);
+        }
+        let mut result = Vec::with_capacity(answer.service_types.len());
+        for entry in &answer.service_types {
+            let raw_code = entry
+                .service_type
+                .as_deref()
+                .ok_or(Error::InvalidResponse)?;
+            let code = raw_code.trim();
+            if !wire::valid_capability_service_code(code)
+                || entry.countries.len() > wire::CAPABILITY_SERVICE_LIMIT
+            {
+                return Err(Error::InvalidResponse);
+            }
+            let countries = entry
+                .countries
+                .iter()
+                .map(|raw_country| CountryCode::from_capability(raw_country))
+                .collect();
+            result.push(ServiceCountries {
+                service_type: code.to_owned(),
+                countries,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Calls the COD4SERVICES method of one carrier and returns the
+    /// normalized cash-on-delivery destinations per service. Every country
+    /// sent by the provider is kept. A carrier without the optional
+    /// dictionary returns an empty list.
+    pub fn cod(&self, carrier: &CarrierCode) -> Result<Vec<ServiceCOD>> {
+        if !carrier.is_valid() {
+            return Err(Error::InvalidRequest);
+        }
+        let Some(answer) =
+            self.capability_get::<wire::CodResponse>(&format!("/{carrier}/cod4services"), true)?
+        else {
+            return Ok(Vec::new());
+        };
+        if answer.service_types.len() > wire::CAPABILITY_SERVICE_LIMIT {
+            return Err(Error::InvalidResponse);
+        }
+        let mut result = Vec::with_capacity(answer.service_types.len());
+        for entry in &answer.service_types {
+            let raw_code = entry
+                .service_type
+                .as_deref()
+                .ok_or(Error::InvalidResponse)?;
+            let code = raw_code.trim();
+            if !wire::valid_capability_service_code(code)
+                || entry.countries.len() > wire::CAPABILITY_SERVICE_LIMIT
+            {
+                return Err(Error::InvalidResponse);
+            }
+            let countries = wire::normalize_cod_countries(&entry.countries)?;
+            result.push(ServiceCOD {
+                service_type: code.to_owned(),
+                countries,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Discovers the contracted carriers and their activated services in one
+    /// run. Without a scope every carrier of the account is discovered; an
+    /// explicit empty scope discovers none. Every requested carrier must
+    /// belong to the account. The returned destinations are restricted to EU
+    /// countries.
+    pub fn carrier_capabilities(&self, scope: Option<&[CarrierCode]>) -> Result<Vec<Carrier>> {
+        let whoami = self.verified_who_am_i(false)?;
+        let mut carriers = wire::scoped_capability_carriers(&whoami.carriers, scope)?;
+        for carrier in &mut carriers {
+            let activated = self
+                .capability_get::<wire::ActivatedServicesResponse>(
+                    &format!("/{}/activatedservices", carrier.carrier_code),
+                    false,
+                )?
+                .ok_or(Error::InvalidResponse)?;
+            let countries = self
+                .capability_get::<wire::CountriesResponse>(
+                    &format!("/{}/countries4service", carrier.carrier_code),
+                    false,
+                )?
+                .ok_or(Error::InvalidResponse)?;
+            carrier.services = wire::normalize_capabilities(
+                &activated,
+                &countries,
+                &wire::CodResponse::default(),
+            )?;
+        }
+        Ok(carriers)
     }
 
     /// Returns the branches of one carrier service in one country. The route
@@ -108,14 +265,8 @@ impl Client {
             return Err(Error::InvalidRequest);
         }
         let (path, filter_country) = wire::branches_path(carrier, service, country);
-        let response =
-            wire::request(self, http::Method::GET, &path, None).map_err(
-                |failure| match failure {
-                    RequestFailure::Transport(_) | RequestFailure::BodyLimit => {
-                        Error::Unavailable { retry_after: None }
-                    }
-                },
-            )?;
+        let response = wire::request(self, http::Method::GET, &path, None)
+            .map_err(|_| Error::Unavailable { retry_after: None })?;
         if response.status == 429 || response.status >= 500 {
             return Err(Error::Unavailable { retry_after: None });
         }
@@ -422,7 +573,10 @@ impl Client {
             &format!("/{carrier}/orderpickup"),
             Some(&body),
         )
-        .map_err(|_| Error::Ambiguous)?;
+        .map_err(|failure| match failure {
+            RequestFailure::AccountUnverified => Error::Rejected,
+            _ => Error::Ambiguous,
+        })?;
         if response.status != 200 {
             return Err(wire::pickup_status_error(response.status));
         }
@@ -621,6 +775,62 @@ impl Client {
             _ => return Err(Error::InvalidResponse),
         }
         Ok((bytes, media_type))
+    }
+
+    fn capability_get<T>(&self, path: &str, allow_unsupported: bool) -> Result<Option<T>>
+    where
+        T: serde::de::DeserializeOwned + wire::CapabilityStatus,
+    {
+        let response = wire::request(self, http::Method::GET, path, None)
+            .map_err(|_| Error::Unavailable { retry_after: None })?;
+        if allow_unsupported && response.status == 501 {
+            return Ok(None);
+        }
+        if response.status == 429 || response.status >= 500 {
+            return Err(Error::Unavailable { retry_after: None });
+        }
+        if response.status != 200 || !wire::is_json(&response) {
+            return Err(Error::InvalidResponse);
+        }
+        let parsed: T =
+            serde_json::from_slice(&response.body).map_err(|_| Error::InvalidResponse)?;
+        match parsed.status_value() {
+            Some(200) => Ok(Some(parsed)),
+            Some(501) if allow_unsupported => Ok(None),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
+
+    fn verified_who_am_i(&self, allow_cached: bool) -> Result<wire::WhoAmIWire> {
+        if allow_cached && self.live_account.is_none() {
+            return Ok(wire::WhoAmIWire::default());
+        }
+        let mut state = self
+            .account_state
+            .lock()
+            .map_err(|_| Error::InvalidResponse)?;
+        if allow_cached
+            && state
+                .verified_at
+                .is_some_and(|at| at.elapsed() < ACCOUNT_MODE_CACHE_TTL)
+        {
+            return Ok(wire::WhoAmIWire::default());
+        }
+        state.verified_at = None;
+        let whoami = self
+            .capability_get::<wire::WhoAmIWire>("/info/whoami", false)?
+            .ok_or(Error::InvalidResponse)?;
+        if let Some(expected) = self.live_account {
+            if whoami.live_account != Some(expected) {
+                return Err(Error::InvalidResponse);
+            }
+            state.verified_at = Some(Instant::now());
+        }
+        Ok(whoami)
+    }
+
+    pub(crate) fn verify_write_allowed(&self) -> Result<()> {
+        self.verified_who_am_i(true).map(|_| ())
     }
 }
 
