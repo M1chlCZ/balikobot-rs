@@ -8,8 +8,8 @@ pub mod models;
 #[doc(hidden)]
 pub mod wire;
 
-pub use client::Client;
+pub use client::{Client, resolve_branch_id};
 pub use codes::{CarrierCode, CountryCode, CurrencyCode};
 pub use config::Config;
 pub use error::{Error, Result};
-pub use models::Branch;
+pub use models::{AddPackageRequest, AddPackageResult, Branch, OverviewPackage};

@@ -123,6 +123,37 @@ pub fn retry_after(response: &RawResponse) -> Option<Duration> {
     ))
 }
 
+/// Maps a top-level provider body status to the public error set. A missing
+/// status is accepted, because some documented answers omit it.
+pub fn top_level_status_error(status: Option<i64>) -> crate::Result<()> {
+    match status {
+        None | Some(200 | 208) => Ok(()),
+        Some(426 | 503) => Err(Error::Unavailable { retry_after: None }),
+        Some(400 | 402 | 403 | 404 | 405 | 406 | 409 | 413 | 423 | 501) => Err(Error::Rejected),
+        Some(_) => Err(Error::InvalidResponse),
+    }
+}
+
+/// Classifies the HTTP answer of a label lookup before its body is decoded.
+pub fn label_lookup_status(response: &RawResponse) -> crate::Result<()> {
+    if response.status == 429 {
+        return Err(Error::Unavailable {
+            retry_after: retry_after(response),
+        });
+    }
+    if response.status >= 500 {
+        return Err(Error::Unavailable { retry_after: None });
+    }
+    if response.status != 200 || !is_json(response) {
+        return Err(if (400..500).contains(&response.status) {
+            Error::Rejected
+        } else {
+            Error::InvalidResponse
+        });
+    }
+    Ok(())
+}
+
 /// Reports whether a provider label URL is allowed for this client.
 pub fn valid_label_url(client: &Client, raw: &str) -> bool {
     let Ok(url) = Url::parse(raw) else {
@@ -191,6 +222,7 @@ fn label_scheme_allowed(url: &Url) -> bool {
 
 const BRANCH_FIELD_LIMIT: usize = 200;
 const ZIP_LIMIT: usize = 16;
+pub(crate) const IDENTIFIER_LIMIT: usize = 100;
 
 /// The decoded body of a `BRANCHES` response.
 #[derive(Debug, Deserialize)]
@@ -251,10 +283,7 @@ pub struct BranchWire {
 /// Decodes a `BRANCHES` response body. The top-level body must be a JSON
 /// object; arrays, scalars, and `null` are rejected.
 pub fn parse_branches(body: &[u8]) -> Option<BranchesResponse> {
-    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
-        return None;
-    }
-    serde_json::from_slice(body).ok()
+    parse_object(body)
 }
 
 /// Converts one parsed branch into the public model, or rejects it.
@@ -307,6 +336,120 @@ pub fn branches_path(
         "sp" | "ulozenka" => (path, true),
         _ => (path, true),
     }
+}
+
+/// The decoded body of an `ADD` response.
+#[derive(Debug, Deserialize)]
+pub struct AddResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The decoded package entries.
+    #[serde(default, deserialize_with = "deserialize_lenient_list")]
+    pub packages: Vec<AddPackageStatus>,
+}
+
+/// One per-package entry of an `ADD` response.
+#[derive(Debug, Default, Deserialize)]
+pub struct AddPackageStatus {
+    /// The external package reference.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub eid: String,
+    /// The per-package provider status.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The Balíkobot package reference.
+    #[serde(default, deserialize_with = "deserialize_package_id")]
+    pub package_id: Option<String>,
+    /// The carrier tracking number.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub carrier_id: String,
+    /// The provider label URL.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub label_url: String,
+}
+
+/// The decoded body of an `OVERVIEW` response.
+#[derive(Debug, Deserialize)]
+pub struct OverviewResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The decoded package entries.
+    #[serde(default, deserialize_with = "deserialize_lenient_list")]
+    pub packages: Vec<OverviewPackageStatus>,
+}
+
+/// One open package entry of an `OVERVIEW` response.
+#[derive(Debug, Default, Deserialize)]
+pub struct OverviewPackageStatus {
+    /// The external package reference.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub eid: String,
+    /// The Balíkobot package reference.
+    #[serde(default, deserialize_with = "deserialize_package_id")]
+    pub package_id: Option<String>,
+    /// The carrier tracking number.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub carrier_id: String,
+    /// The provider label URL.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub label_url: String,
+}
+
+/// The decoded body of a `LABELS` response.
+#[derive(Debug, Default, Deserialize)]
+pub struct LabelsResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The aggregate label URL.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub labels_url: String,
+}
+
+/// The decoded body of an `ORDERV` response.
+#[derive(Debug, Default, Deserialize)]
+pub struct OrderViewResponse {
+    /// The top-level body status, when the provider sent a valid one.
+    #[serde(default, deserialize_with = "deserialize_status")]
+    pub status: Option<i64>,
+    /// The provider order reference.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub order_id: String,
+    /// The package references of the order.
+    #[serde(default, deserialize_with = "deserialize_package_ids")]
+    pub package_ids: Vec<String>,
+    /// The aggregate label URL.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub labels_url: String,
+}
+
+/// Decodes an `ADD` response body.
+pub fn parse_add(body: &[u8]) -> Option<AddResponse> {
+    parse_object(body)
+}
+
+/// Decodes an `OVERVIEW` response body.
+pub fn parse_overview(body: &[u8]) -> Option<OverviewResponse> {
+    parse_object(body)
+}
+
+/// Decodes a `LABELS` response body.
+pub fn parse_labels(body: &[u8]) -> Option<LabelsResponse> {
+    parse_object(body)
+}
+
+/// Decodes an `ORDERV` response body.
+pub fn parse_order_view(body: &[u8]) -> Option<OrderViewResponse> {
+    parse_object(body)
+}
+
+fn parse_object<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
+    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
+    serde_json::from_slice(body).ok()
 }
 
 fn deserialize_branch_list<'de, D>(deserializer: D) -> Result<Vec<BranchWire>, D::Error>
@@ -443,7 +586,67 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-fn valid_branch_id(value: &str) -> bool {
+fn deserialize_lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<Vec<Option<T>>>::deserialize(deserializer)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect())
+}
+
+fn deserialize_package_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    package_id_from_raw(raw.get())
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("invalid Balíkobot package id"))
+}
+
+fn deserialize_package_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    if raw.get().trim() == "null" {
+        return Ok(Vec::new());
+    }
+    let values: Vec<Box<RawValue>> = serde_json::from_str(raw.get())
+        .map_err(|_| serde::de::Error::custom("invalid Balíkobot package id"))?;
+    values
+        .iter()
+        .map(|value| {
+            package_id_from_raw(value.get())
+                .ok_or_else(|| serde::de::Error::custom("invalid Balíkobot package id"))
+        })
+        .collect()
+}
+
+fn package_id_from_raw(text: &str) -> Option<String> {
+    let value = if text.starts_with('"') {
+        serde_json::from_str::<String>(text).ok()?
+    } else {
+        if text.contains(['.', 'e', 'E'])
+            || !text.starts_with(|first: char| first.is_ascii_digit() || first == '-')
+        {
+            return None;
+        }
+        text.to_owned()
+    };
+    valid_package_id(&value).then_some(value)
+}
+
+/// Reports whether a value is usable as a package or order reference.
+pub(crate) fn valid_package_id(value: &str) -> bool {
+    !value.is_empty() && valid_branch_field(value, IDENTIFIER_LIMIT)
+}
+
+pub(crate) fn valid_branch_id(value: &str) -> bool {
     let bytes = value.as_bytes();
     (1..=64).contains(&bytes.len())
         && bytes[0].is_ascii_alphanumeric()
@@ -452,7 +655,7 @@ fn valid_branch_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn valid_branch_field(value: &str, maximum: usize) -> bool {
+pub(crate) fn valid_branch_field(value: &str, maximum: usize) -> bool {
     value.chars().count() <= maximum && !value.contains(['\r', '\n', '\0'])
 }
 
