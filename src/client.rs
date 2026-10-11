@@ -223,8 +223,8 @@ impl Client {
     /// Discovers the contracted carriers and their activated services in one
     /// run. Without a scope every carrier of the account is discovered; an
     /// explicit empty scope discovers none. Every requested carrier must
-    /// belong to the account. The returned destinations are restricted to EU
-    /// countries.
+    /// belong to the account. The combined discovery keeps only EU
+    /// destinations.
     pub fn carrier_capabilities(&self, scope: Option<&[CarrierCode]>) -> Result<Vec<Carrier>> {
         let whoami = self.verified_who_am_i(false)?;
         let mut carriers = wire::scoped_capability_carriers(&whoami.carriers, scope)?;
@@ -553,9 +553,9 @@ impl Client {
         }
     }
 
-    /// Calls the ORDERPICKUP method and books one physical collection,
-    /// separately from the shipment data handover performed by ORDER. The
-    /// call performs exactly one HTTP attempt. DPD and DPDCZ take the
+    /// Calls the ORDERPICKUP method and books one physical collection.
+    /// ORDERPICKUP books separately from the shipment data handover of ORDER.
+    /// The call performs exactly one HTTP attempt. DPD and DPDCZ take the
     /// collection address from the carrier configuration; PPL also defaults
     /// its contact information to that configuration.
     pub fn order_pickup(
@@ -616,9 +616,9 @@ impl Client {
 
     /// Calls the OVERVIEW method, which lists the packages of a carrier that
     /// have not yet been closed by ORDER. `match_eid` names the single entry
-    /// whose integrity is required for reconciliation: a malformed entry with
-    /// a different EID is skipped, while a malformed matching entry fails the
-    /// call.
+    /// whose integrity the call requires for reconciliation: the call skips a
+    /// malformed entry with a different EID, while a malformed matching entry
+    /// fails the call.
     pub fn overview(&self, carrier: &CarrierCode, match_eid: &str) -> Result<Vec<OverviewPackage>> {
         if !carrier.is_valid() {
             return Err(Error::InvalidRequest);
@@ -688,9 +688,9 @@ impl Client {
         Ok(parsed.labels_url)
     }
 
-    /// Retrieves the label URL of an already closed ORDER. The returned URL
-    /// is accepted only when the response confirms both the requested order
-    /// id and the membership of the requested package id.
+    /// Retrieves the label URL of an already closed ORDER. The call accepts
+    /// the returned URL only when the response confirms both the requested
+    /// order id and the membership of the requested package id.
     pub fn order_view_labels(
         &self,
         carrier: &CarrierCode,
@@ -720,9 +720,9 @@ impl Client {
         Ok(parsed.labels_url)
     }
 
-    /// Fetches a provider label URL server-to-server. The body is read once
-    /// with a hard byte limit and validated against the declared label media
-    /// type. The returned body is owned by the caller.
+    /// Fetches a provider label URL server-to-server. The call reads the body
+    /// once with a hard byte limit and validates it against the declared
+    /// label media type. The caller owns the returned body.
     pub fn download_label(&self, label_url: &str) -> Result<(Vec<u8>, String)> {
         if !wire::valid_label_url(self, label_url) {
             return Err(Error::InvalidRequest);

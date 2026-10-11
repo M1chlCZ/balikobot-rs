@@ -1,3 +1,7 @@
+## 0.1.1
+
+- Documentation and internal cleanup.
+
 ## 0.1.0
 
 - Parity port of balikobot-go v0.2.0.

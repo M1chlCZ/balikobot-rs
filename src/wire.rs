@@ -37,11 +37,11 @@ pub struct RawResponse {
 #[doc(hidden)]
 #[derive(Debug)]
 pub enum RequestFailure {
-    /// The request could not be completed.
+    /// The request did not complete.
     Transport(ureq::Error),
     /// The decoded response body exceeds the configured limit.
     BodyLimit,
-    /// The account mode could not be verified before the write.
+    /// The account mode check for the write failed.
     AccountUnverified,
 }
 
@@ -134,7 +134,7 @@ fn valid_media_parameter(parameter: &str) -> bool {
         .is_some_and(|(name, _)| !name.trim().is_empty())
 }
 
-/// Returns the integer `Retry-After` hint, clamped to one hour.
+/// Returns the integer `Retry-After` hint and clamps it to one hour.
 pub fn retry_after(response: &RawResponse) -> Option<Duration> {
     let seconds = response
         .headers
@@ -152,8 +152,8 @@ pub fn retry_after(response: &RawResponse) -> Option<Duration> {
     ))
 }
 
-/// Maps a top-level provider body status to the public error set. A missing
-/// status is accepted, because some documented answers omit it.
+/// Maps a top-level provider body status to the public error set. The call
+/// accepts a missing status, because some documented answers omit it.
 pub fn top_level_status_error(status: Option<i64>) -> crate::Result<()> {
     match status {
         None | Some(200 | 208) => Ok(()),
@@ -163,7 +163,8 @@ pub fn top_level_status_error(status: Option<i64>) -> crate::Result<()> {
     }
 }
 
-/// Classifies the HTTP answer of a label lookup before its body is decoded.
+/// Classifies the HTTP answer of a label lookup before the decoder reads the
+/// body.
 pub fn label_lookup_status(response: &RawResponse) -> crate::Result<()> {
     if response.status == 429 {
         return Err(Error::Unavailable {
@@ -183,9 +184,9 @@ pub fn label_lookup_status(response: &RawResponse) -> crate::Result<()> {
     Ok(())
 }
 
-/// Classifies the HTTP answer of a `TRACKSTATUS` call before its body is
-/// decoded. A `4xx` answer other than 404 fails the whole account, so it is
-/// retryable instead of permanently rejected.
+/// Classifies the HTTP answer of a `TRACKSTATUS` call before the decoder
+/// reads the body. A `4xx` answer other than 404 fails the whole account, so
+/// it stays retryable instead of permanently rejected.
 pub fn track_http_status(response: &RawResponse) -> crate::Result<()> {
     if response.status == 429 {
         return Err(Error::Unavailable {
@@ -261,8 +262,8 @@ pub fn dispatch_error(error: &ureq::Error) -> Error {
 }
 
 /// Reports whether the raw URL spells an explicit path after the authority.
-/// The `url` crate normalizes a missing path to `/`, so the raw text is the
-/// only place where an absent path is visible.
+/// The `url` crate normalizes a missing path to `/`, so only the raw text
+/// shows an absent path.
 fn raw_path_is_explicit(raw: &str) -> bool {
     let Some((_, remainder)) = raw.split_once("://") else {
         return false;
@@ -355,7 +356,7 @@ pub struct BranchWire {
 }
 
 /// Decodes a `BRANCHES` response body. The top-level body must be a JSON
-/// object; arrays, scalars, and `null` are rejected.
+/// object; the parser rejects arrays, scalars, and `null`.
 pub fn parse_branches(body: &[u8]) -> Option<BranchesResponse> {
     parse_object(body)
 }
@@ -1035,7 +1036,7 @@ pub struct CodCountryWire {
 }
 
 /// Normalizes the activated service entries of one carrier and returns them
-/// with a lookup by service code.
+/// with a map from service code to index.
 pub(crate) fn normalize_activated_services(
     activated: &ActivatedServicesResponse,
 ) -> crate::Result<(Vec<Service>, HashMap<String, usize>)> {
@@ -1074,8 +1075,8 @@ pub(crate) fn normalize_capabilities(
     Ok(services)
 }
 
-/// Selects the contracted carriers to discover. Without a scope every
-/// contracted carrier is selected; an empty scope selects none. A requested
+/// Selects the contracted carriers to discover. Without a scope the call
+/// selects every contracted carrier; an empty scope selects none. A requested
 /// carrier that is not contracted fails the call.
 pub(crate) fn scoped_capability_carriers(
     contracted: &[CapabilityCarrierWire],
