@@ -1,3 +1,13 @@
+## [Unreleased]
+
+- Batch label download through `Client::download_batch_labels`: a single
+  package id returns a PDF or ZPL body, several package ids return a ZIP
+  archive, and the call accepts up to 1000 ids.
+- Tracking webhook parsing through `parse_tracking_notifications` and the
+  `TrackingNotification` model: single objects and arrays of up to 1000
+  entries with strict validation.
+- Continuous integration and crates.io release workflows.
+
 ## 0.1.1
 
 - Documentation and internal cleanup.

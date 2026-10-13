@@ -13,4 +13,4 @@ pub use capabilities::{
 };
 pub use pickup::{PickupRequest, PickupResult};
 pub use shipment::{AddPackageRequest, AddPackageResult, OverviewPackage};
-pub use tracking::{OrderResult, TrackStatusResult};
+pub use tracking::{OrderResult, TrackStatusResult, TrackingNotification};

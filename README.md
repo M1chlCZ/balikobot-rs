@@ -1,8 +1,9 @@
 # balikobot
 
 A Rust client for the Balíkobot shipping API v2. The client is blocking and
-covers branches, packages, labels, tracking, pickup orders and account
-capabilities. The default endpoint is `https://apiv2.balikobot.cz`.
+covers branches, packages, labels, tracking, pickup orders, account
+capabilities and tracking webhooks. The default endpoint is
+`https://apiv2.balikobot.cz`.
 
 ## Install
 
@@ -71,6 +72,7 @@ fn main() -> balikobot::Result<()> {
 | `labels` | `POST /{carrier}/labels` | Gets a fresh label URL for one package |
 | `order_view_labels` | `GET /{carrier}/orderview/{order_id}` | Gets the label URL of a closed order |
 | `download_label` | `GET` the label URL | Downloads the label body |
+| `download_batch_labels` | `POST /{carrier}/labels` | Downloads one or more fresh labels in one step |
 | `track_status` | `POST /{carrier}/trackstatus` | Reads the tracking status of one package |
 | `order_batch` | `POST /{carrier}/order` | Hands one package to the carrier batch |
 | `drop_package` | `POST /{carrier}/drop` | Removes one package before ORDER |
@@ -81,6 +83,15 @@ fn main() -> balikobot::Result<()> {
 | `cod` | `GET /{carrier}/cod4services` | Lists the cash-on-delivery destinations |
 | `carrier_capabilities` | `GET` the discovery endpoints | Discovers the contracted carriers and services |
 | `resolve_branch_id` | none | Chooses the branch id or the branch zip for an ADD request |
+| `parse_tracking_notifications` | none | Parses a tracking webhook body |
+
+## Batch labels
+
+`download_batch_labels` requests fresh labels for up to 1000 packages in one
+call. The method follows the same rules as `download_label`: the label host
+allowlist, the declared media type, the matching magic bytes and the fixed
+4 MiB limit. One package id returns a PDF or ZPL body, while several package
+ids return a ZIP archive.
 
 ## Codes
 
@@ -139,9 +150,10 @@ The client sends no automatic retry. The caller controls the retry policy.
 ## Response limits
 
 The client reads every JSON body with a hard limit of 8 MiB. Set
-`Config::with_max_response_bytes` to change the limit. Label downloads use a
-fixed limit of 4 MiB. The client refuses redirects. It compares the response
-`Content-Type` with the expected media type before it decodes the body.
+`Config::with_max_response_bytes` to change the limit. Label downloads,
+including batch downloads, use a fixed limit of 4 MiB. The client refuses
+redirects. It compares the response `Content-Type` with the expected media
+type before it decodes the body.
 
 ## Account mode
 
@@ -159,6 +171,22 @@ the base URL origin for a loopback test server. The default allowlist is
 `Config::with_label_hosts` to replace the default allowlist with other hosts.
 A leading dot selects a subdomain suffix match; it does not match the bare
 domain.
+
+## Tracking webhooks
+
+`parse_tracking_notifications` parses the JSON body of a Balíkobot tracking
+webhook. The body can be a single notification object or an array of up to
+1000 objects. Every entry must identify the package through `package_id`,
+`eid` or `carrier_id`, and carry a decimal `status_id` or `status_id_v2`
+together with a description in `name` or `status_text`. A malformed body or a
+missing required field returns `Error::InvalidResponse`.
+
+```rust
+let notifications = balikobot::parse_tracking_notifications(body)?;
+for notification in notifications {
+    println!("{}: {}", notification.carrier_id, notification.status_text);
+}
+```
 
 ## Development
 

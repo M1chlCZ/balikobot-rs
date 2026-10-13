@@ -1,10 +1,11 @@
 //! A Rust client for the Balikobot shipping API v2.
 //!
 //! The crate wraps the JSON API for packages, labels, tracking, pickups, and
-//! carrier capabilities in a blocking client. Build a [`Client`] from a
-//! [`Config`] and call its methods; the crate returns every failure as a
-//! typed [`Error`] that separates local request validation, permanent
-//! refusals, temporary unavailability, and ambiguous mutating outcomes.
+//! carrier capabilities in a blocking client, and parses provider tracking
+//! webhooks. Build a [`Client`] from a [`Config`] and call its methods; the
+//! crate returns every failure as a typed [`Error`] that separates local
+//! request validation, permanent refusals, temporary unavailability, and
+//! ambiguous mutating outcomes.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +14,7 @@ pub mod codes;
 pub mod config;
 pub mod error;
 pub mod models;
+pub mod webhook;
 #[doc(hidden)]
 pub mod wire;
 
@@ -23,5 +25,6 @@ pub use error::{Error, Result};
 pub use models::{
     ActivatedServices, AddPackageRequest, AddPackageResult, Branch, CODCapability, Carrier,
     OrderResult, OverviewPackage, PickupRequest, PickupResult, Service, ServiceCOD,
-    ServiceCountries, TrackStatusResult, WhoAmI, WhoAmICarrier,
+    ServiceCountries, TrackStatusResult, TrackingNotification, WhoAmI, WhoAmICarrier,
 };
+pub use webhook::parse_tracking_notifications;

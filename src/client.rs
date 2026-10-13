@@ -24,11 +24,13 @@ use crate::{Branch, CarrierCode, CountryCode, CurrencyCode, Error, Result};
 
 const ACCOUNT_MODE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const ADD_FIELD_LIMIT: usize = 255;
+const BATCH_LABEL_PACKAGE_LIMIT: usize = 1_000;
 const LABEL_RESPONSE_LIMIT: usize = 4 << 20;
 const PICKUP_NOTE_LIMIT: usize = 255;
 const PICKUP_PACKAGE_LIMIT: i32 = 10_000;
 const PICKUP_WEIGHT_LIMIT: f64 = 100_000.0;
 const TRACK_REFERENCE_MODULUS: i64 = 10_000_000_000;
+const ZIP_MAGIC_PREFIX: &[u8] = b"PK";
 const ZPL_MAGIC_PREFIX: &str = "^X";
 
 struct AccountState {
@@ -666,26 +668,25 @@ impl Client {
         if !carrier.is_valid() || !wire::valid_package_id(package_id) {
             return Err(Error::InvalidRequest);
         }
-        let body = json!({"package_ids": [package_id]});
-        let response = wire::request(
-            self,
-            http::Method::POST,
-            &format!("/{carrier}/labels"),
-            Some(&body),
-        )
-        .map_err(|_| Error::Unavailable { retry_after: None })?;
-        wire::label_lookup_status(&response)?;
-        let Some(parsed) = wire::parse_labels(&response.body) else {
-            return Err(Error::InvalidResponse);
-        };
-        if parsed.status.is_none() {
-            return Err(Error::InvalidResponse);
+        self.labels_url(carrier, &[package_id.to_owned()])
+    }
+
+    /// Requests fresh labels of one or more packages that have not entered
+    /// ORDER yet and downloads them in one step. A single package id returns
+    /// a PDF or ZPL body; several package ids return a ZIP archive. The
+    /// request accepts at most 1000 package ids. The label URL must pass the
+    /// label host allowlist, and the body is read once with the fixed 4 MiB
+    /// label limit. The caller owns the returned body.
+    pub fn download_batch_labels(
+        &self,
+        carrier: &CarrierCode,
+        package_ids: &[String],
+    ) -> Result<(Vec<u8>, String)> {
+        if !carrier.is_valid() || !valid_batch_package_ids(package_ids) {
+            return Err(Error::InvalidRequest);
         }
-        wire::top_level_status_error(parsed.status)?;
-        if !wire::valid_label_url(self, &parsed.labels_url) {
-            return Err(Error::InvalidResponse);
-        }
-        Ok(parsed.labels_url)
+        let label_url = self.labels_url(carrier, package_ids)?;
+        self.fetch_label_body(&label_url, package_ids.len() > 1)
     }
 
     /// Retrieves the label URL of an already closed ORDER. The call accepts
@@ -724,57 +725,7 @@ impl Client {
     /// once with a hard byte limit and validates it against the declared
     /// label media type. The caller owns the returned body.
     pub fn download_label(&self, label_url: &str) -> Result<(Vec<u8>, String)> {
-        if !wire::valid_label_url(self, label_url) {
-            return Err(Error::InvalidRequest);
-        }
-        let request = http::Request::builder()
-            .method(http::Method::GET)
-            .uri(label_url)
-            .body(Vec::new())
-            .map_err(|_| Error::InvalidRequest)?;
-        let response = self
-            .agent
-            .run(request)
-            .map_err(|_| Error::Unavailable { retry_after: None })?;
-        let (parts, body) = response.into_parts();
-        let status = parts.status.as_u16();
-        if status == 429 || status >= 500 {
-            return Err(Error::Unavailable { retry_after: None });
-        }
-        if status != 200 {
-            return Err(if (400..500).contains(&status) {
-                Error::Rejected
-            } else {
-                Error::InvalidResponse
-            });
-        }
-        let Some(media_type) = parts
-            .headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(wire::parse_media_type)
-        else {
-            return Err(Error::InvalidResponse);
-        };
-        let mut reader = body.into_reader();
-        let mut bytes = Vec::new();
-        if reader
-            .by_ref()
-            .take(LABEL_RESPONSE_LIMIT as u64 + 1)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
-            return Err(Error::Unavailable { retry_after: None });
-        }
-        if bytes.len() > LABEL_RESPONSE_LIMIT || bytes.is_empty() {
-            return Err(Error::InvalidResponse);
-        }
-        match media_type.as_str() {
-            "application/pdf" if bytes.starts_with(b"%PDF-") => {}
-            "application/zpl" if bytes.starts_with(ZPL_MAGIC_PREFIX.as_bytes()) => {}
-            _ => return Err(Error::InvalidResponse),
-        }
-        Ok((bytes, media_type))
+        self.fetch_label_body(label_url, false)
     }
 
     fn capability_get<T>(&self, path: &str, allow_unsupported: bool) -> Result<Option<T>>
@@ -831,6 +782,81 @@ impl Client {
 
     pub(crate) fn verify_write_allowed(&self) -> Result<()> {
         self.verified_who_am_i(true).map(|_| ())
+    }
+
+    fn labels_url(&self, carrier: &CarrierCode, package_ids: &[String]) -> Result<String> {
+        let body = json!({"package_ids": package_ids});
+        let response = wire::request(
+            self,
+            http::Method::POST,
+            &format!("/{carrier}/labels"),
+            Some(&body),
+        )
+        .map_err(|_| Error::Unavailable { retry_after: None })?;
+        wire::label_lookup_status(&response)?;
+        let Some(parsed) = wire::parse_labels(&response.body) else {
+            return Err(Error::InvalidResponse);
+        };
+        if parsed.status.is_none() {
+            return Err(Error::InvalidResponse);
+        }
+        wire::top_level_status_error(parsed.status)?;
+        if !wire::valid_label_url(self, &parsed.labels_url) {
+            return Err(Error::InvalidResponse);
+        }
+        Ok(parsed.labels_url)
+    }
+
+    fn fetch_label_body(&self, label_url: &str, multiple: bool) -> Result<(Vec<u8>, String)> {
+        if !wire::valid_label_url(self, label_url) {
+            return Err(Error::InvalidRequest);
+        }
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(label_url)
+            .body(Vec::new())
+            .map_err(|_| Error::InvalidRequest)?;
+        let response = self
+            .agent
+            .run(request)
+            .map_err(|_| Error::Unavailable { retry_after: None })?;
+        let (parts, body) = response.into_parts();
+        let status = parts.status.as_u16();
+        if status == 429 || status >= 500 {
+            return Err(Error::Unavailable { retry_after: None });
+        }
+        if status != 200 {
+            return Err(if (400..500).contains(&status) {
+                Error::Rejected
+            } else {
+                Error::InvalidResponse
+            });
+        }
+        let Some(media_type) = parts
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(wire::parse_media_type)
+        else {
+            return Err(Error::InvalidResponse);
+        };
+        let Some(prefix) = label_prefix(&media_type, multiple) else {
+            return Err(Error::InvalidResponse);
+        };
+        let mut reader = body.into_reader();
+        let mut bytes = Vec::new();
+        if reader
+            .by_ref()
+            .take(LABEL_RESPONSE_LIMIT as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return Err(Error::Unavailable { retry_after: None });
+        }
+        if bytes.len() > LABEL_RESPONSE_LIMIT || bytes.is_empty() || !bytes.starts_with(prefix) {
+            return Err(Error::InvalidResponse);
+        }
+        Ok((bytes, media_type))
     }
 }
 
@@ -1028,4 +1054,21 @@ fn valid_eid(eid: &str) -> bool {
 
 fn valid_service(service: &str) -> bool {
     (1..=16).contains(&service.len()) && service.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn valid_batch_package_ids(package_ids: &[String]) -> bool {
+    !package_ids.is_empty()
+        && package_ids.len() <= BATCH_LABEL_PACKAGE_LIMIT
+        && package_ids
+            .iter()
+            .all(|package_id| wire::valid_package_id(package_id))
+}
+
+fn label_prefix(media_type: &str, multiple: bool) -> Option<&'static [u8]> {
+    match media_type {
+        "application/pdf" if !multiple => Some(b"%PDF-"),
+        "application/zpl" if !multiple => Some(ZPL_MAGIC_PREFIX.as_bytes()),
+        "application/zip" if multiple => Some(ZIP_MAGIC_PREFIX),
+        _ => None,
+    }
 }

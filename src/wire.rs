@@ -534,6 +534,32 @@ pub struct TrackStatusPackage {
     pub status: Option<i64>,
 }
 
+/// One entry of a tracking webhook body before normalizing.
+#[derive(Debug, Default, Deserialize)]
+pub struct TrackingNotificationWire {
+    /// The Balíkobot package reference, when the provider sent one.
+    #[serde(default, deserialize_with = "deserialize_tracking_identifier")]
+    pub package_id: Option<String>,
+    /// The external package reference, when the provider sent one.
+    #[serde(default, deserialize_with = "deserialize_tracking_identifier")]
+    pub eid: Option<String>,
+    /// The carrier tracking number, when the provider sent one.
+    #[serde(default, deserialize_with = "deserialize_tracking_identifier")]
+    pub carrier_id: Option<String>,
+    /// The coarse provider status code, when the provider sent one.
+    #[serde(default, deserialize_with = "deserialize_track_status_id")]
+    pub status_id: Option<String>,
+    /// The detailed provider status code, when the provider sent one.
+    #[serde(default, deserialize_with = "deserialize_track_status_id")]
+    pub status_id_v2: Option<String>,
+    /// The provider status description.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub name: String,
+    /// The fallback provider status description.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub status_text: String,
+}
+
 /// The decoded body of an `ORDER` response.
 #[derive(Debug, Deserialize)]
 pub struct OrderResponse {
@@ -590,6 +616,22 @@ pub fn parse_order_view(body: &[u8]) -> Option<OrderViewResponse> {
 /// Decodes a `TRACKSTATUS` response body.
 pub fn parse_track_status(body: &[u8]) -> Option<TrackStatusResponse> {
     parse_object(body)
+}
+
+/// Decodes a tracking webhook body. The body can be a single notification
+/// object or an array of objects; an empty array decodes to an empty list.
+pub fn parse_tracking_notifications(body: &[u8]) -> Option<Vec<TrackingNotificationWire>> {
+    match body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+    {
+        Some(b'{') => serde_json::from_slice::<TrackingNotificationWire>(body)
+            .ok()
+            .map(|single| vec![single]),
+        Some(b'[') => serde_json::from_slice::<Vec<TrackingNotificationWire>>(body).ok(),
+        _ => None,
+    }
 }
 
 /// Decodes an `ORDER` response body.
@@ -742,6 +784,41 @@ fn valid_track_status_id(text: &str) -> bool {
         index += 1;
     }
     (1..=2).contains(&(index - fraction_start)) && index == bytes.len()
+}
+
+fn deserialize_tracking_identifier<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    let text = raw.get();
+    if text == "null" {
+        return Ok(None);
+    }
+    let value = if text.starts_with('"') {
+        serde_json::from_str::<String>(text)
+            .map_err(|_| serde::de::Error::custom("invalid Balíkobot tracking identifier"))?
+    } else {
+        if text.contains(['.', 'e', 'E'])
+            || !text.starts_with(|first: char| first.is_ascii_digit() || first == '-')
+        {
+            return Err(serde::de::Error::custom(
+                "invalid Balíkobot tracking identifier",
+            ));
+        }
+        text.to_owned()
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !valid_branch_field(&value, IDENTIFIER_LIMIT) {
+        return Err(serde::de::Error::custom(
+            "invalid Balíkobot tracking identifier",
+        ));
+    }
+    Ok(Some(value))
 }
 
 fn deserialize_branch_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
