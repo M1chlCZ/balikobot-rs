@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.2.0] - 2026-10-13
 
 - Batch label download through `Client::download_batch_labels`: a single
   package id returns a PDF or ZPL body, several package ids return a ZIP
