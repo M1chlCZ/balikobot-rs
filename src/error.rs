@@ -22,6 +22,10 @@ pub enum Error {
     /// A mutating call may have reached the provider. Reconcile the result by
     /// external reference before any retry.
     Ambiguous,
+    /// The carrier reported an error for the requested `eid` during `ADD`, so
+    /// the package may exist. Reconcile the result by external reference
+    /// before any retry. It counts as ambiguous through [`Error::is_ambiguous`].
+    CarrierOutage,
     /// A provider answer that violates the protocol.
     InvalidResponse,
     /// An invalid client configuration.
@@ -44,6 +48,13 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Reports whether the call may have reached the provider and the result
+    /// must be reconciled before a retry. It covers [`Error::Ambiguous`] and
+    /// [`Error::CarrierOutage`].
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::Ambiguous | Self::CarrierOutage)
+    }
 }
 
 impl fmt::Display for Error {
@@ -62,6 +73,7 @@ impl fmt::Display for Error {
             ),
             Self::NotFound => f.write_str("balikobot: resource not found"),
             Self::Ambiguous => f.write_str("balikobot: request outcome is unknown"),
+            Self::CarrierOutage => f.write_str("balikobot: carrier reported an error during ADD"),
             Self::InvalidResponse => f.write_str("balikobot: invalid provider response"),
             Self::Config(message) => write!(f, "balikobot: invalid configuration: {message}"),
             Self::InvalidCode { kind, value } => {
@@ -122,5 +134,16 @@ mod tests {
         );
         assert_eq!(Error::Unavailable { retry_after: None }.retry_after(), None);
         assert_eq!(Error::NotFound.retry_after(), None);
+    }
+
+    #[test]
+    fn carrier_outage_requires_reconciliation() {
+        assert!(Error::Ambiguous.is_ambiguous());
+        assert!(Error::CarrierOutage.is_ambiguous());
+        assert!(!Error::Rejected.is_ambiguous());
+        assert_eq!(
+            Error::CarrierOutage.to_string(),
+            "balikobot: carrier reported an error during ADD"
+        );
     }
 }

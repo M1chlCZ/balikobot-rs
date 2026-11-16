@@ -154,6 +154,73 @@ fn add_package_treats_an_oversized_500_body_as_unavailable() {
 }
 
 #[test]
+fn add_package_reports_a_carrier_outage_as_ambiguous() {
+    for (status_line, body) in [
+        (
+            "400 Bad Request",
+            r#"{"status":400,"packages":[{"eid":"018f00000000400080000000000000aa-S1","status":400,"errors":[{"attribute":"carrier_error"}],"package_id":null}]}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"status":400,"packages":[{"eid":"018f00000000400080000000000000aa-S1","status":"400","errors":[{"attribute":"carrier_error"}]}]}"#,
+        ),
+        (
+            "503 Service Unavailable",
+            r#"{"status":503,"packages":[{"eid":"018f00000000400080000000000000aa-S1","status":503,"errors":[{"attribute":"carrier_error"}]}]}"#,
+        ),
+    ] {
+        let server = json_serve(status_line, move |_| body.as_bytes().to_vec());
+        let error = loopback_client(server.port)
+            .add_package(&CarrierCode::PPL, &valid_request())
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::CarrierOutage),
+            "{status_line} returned {error}"
+        );
+        assert!(error.is_ambiguous());
+    }
+}
+
+#[test]
+fn add_package_keeps_the_http_error_for_another_eid() {
+    let server = json_serve("400 Bad Request", |_| {
+        br#"{"status":400,"packages":[{"eid":"OTHER","status":400,"errors":[{"attribute":"carrier_error"}]}]}"#
+            .to_vec()
+    });
+    let error = loopback_client(server.port)
+        .add_package(&CarrierCode::PPL, &valid_request())
+        .unwrap_err();
+    assert!(matches!(error, Error::Rejected));
+}
+
+#[test]
+fn overview_requires_an_explicit_package_list() {
+    for body in [
+        r#"{}"#,
+        r#"{"status":200}"#,
+        r#"{"status":"208","packages":null}"#,
+    ] {
+        let server = json_serve("200 OK", move |_| body.as_bytes().to_vec());
+        let error = loopback_client(server.port)
+            .overview(&CarrierCode::PPL, "018f00000000400080000000000000aa-S1")
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidResponse),
+            "{body} returned {error}"
+        );
+    }
+}
+
+#[test]
+fn overview_accepts_an_explicit_empty_package_list() {
+    let server = json_serve("200 OK", |_| br#"{"status":200,"packages":[]}"#.to_vec());
+    let packages = loopback_client(server.port)
+        .overview(&CarrierCode::PPL, "018f00000000400080000000000000aa-S1")
+        .expect("overview");
+    assert!(packages.is_empty());
+}
+
+#[test]
 fn overview_returns_packages_and_accepts_integer_ids() {
     let server = json_serve("200 OK", |port| {
         format!(

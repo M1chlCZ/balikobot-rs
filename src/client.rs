@@ -310,7 +310,7 @@ impl Client {
         let body = json!({
             "packages": [serde_json::to_value(request).map_err(|_| Error::Ambiguous)?]
         });
-        let response = wire::request(
+        let response = wire::request_with_error_body(
             self,
             http::Method::POST,
             &format!("/{carrier}/add"),
@@ -318,67 +318,42 @@ impl Client {
         )
         .map_err(ambiguous_request_failure)?;
         let status = response.status;
-        if status == 429 {
-            return Err(Error::Unavailable {
+        let status_error = if status == 429 {
+            Some(Error::Unavailable {
                 retry_after: wire::retry_after(&response),
-            });
-        }
-        if status >= 500 {
-            return Err(Error::Unavailable { retry_after: None });
-        }
-        if status != 200 {
-            return Err(if (200..300).contains(&status) {
+            })
+        } else if status >= 500 {
+            Some(Error::Unavailable { retry_after: None })
+        } else if status != 200 {
+            Some(if (200..300).contains(&status) {
                 Error::Ambiguous
             } else if (400..500).contains(&status) {
                 Error::Rejected
             } else {
                 Error::InvalidResponse
-            });
-        }
-        if !wire::is_json(&response) {
-            return Err(Error::Ambiguous);
-        }
-        let Some(parsed) = wire::parse_add(&response.body) else {
-            return Err(Error::Ambiguous);
+            })
+        } else if !wire::is_json(&response) {
+            Some(Error::Ambiguous)
+        } else {
+            None
         };
-        if parsed.status.is_none() {
-            return Err(Error::Ambiguous);
-        }
-        if let Err(error) = wire::top_level_status_error(parsed.status) {
-            return Err(if error == Error::InvalidResponse {
-                Error::Ambiguous
-            } else {
-                error
-            });
-        }
-        if parsed.packages.len() != 1 || parsed.packages[0].eid != request.eid {
-            return Err(Error::Ambiguous);
-        }
-        let entry = &parsed.packages[0];
-        let Some(entry_status) = entry.status else {
-            return Err(Error::Ambiguous);
-        };
-        match entry_status {
-            200 | 208 => {
-                let Some(package_id) = &entry.package_id else {
-                    return Err(Error::Ambiguous);
-                };
-                if entry.carrier_id.is_empty()
-                    || !wire::valid_branch_field(&entry.carrier_id, wire::IDENTIFIER_LIMIT)
-                    || !wire::valid_label_url(self, &entry.label_url)
-                {
-                    return Err(Error::Ambiguous);
-                }
-                Ok(AddPackageResult {
-                    package_id: package_id.clone(),
-                    carrier_id: entry.carrier_id.clone(),
-                    label_url: entry.label_url.clone(),
-                })
+        if let Some(error) = status_error {
+            if !(400..600).contains(&status) || !wire::is_json(&response) {
+                return Err(error);
             }
-            426 | 503 => Err(Error::Unavailable { retry_after: None }),
-            400 | 403 | 404 | 405 | 406 | 409 | 413 | 423 | 501 => Err(Error::Rejected),
-            _ => Err(Error::Ambiguous),
+            if wire::add_carrier_outage(&response.body, &request.eid) {
+                return Err(Error::CarrierOutage);
+            }
+            return Err(error);
         }
+        let error = match decode_add_package(self, &response.body, &request.eid) {
+            Ok(result) => return Ok(result),
+            Err(error) => error,
+        };
+        if wire::add_carrier_outage(&response.body, &request.eid) {
+            return Err(Error::CarrierOutage);
+        }
+        Err(error)
     }
 
     /// Calls the TRACKSTATUS method for one carrier tracking number and
@@ -651,8 +626,11 @@ impl Client {
             return Err(Error::InvalidResponse);
         };
         wire::top_level_status_error(parsed.status)?;
-        let mut packages = Vec::with_capacity(parsed.packages.len());
-        for entry in &parsed.packages {
+        let Some(entries) = parsed.packages else {
+            return Err(Error::InvalidResponse);
+        };
+        let mut packages = Vec::with_capacity(entries.len());
+        for entry in &entries {
             match sanitize_overview_entry(self, entry) {
                 Some(package) => packages.push(package),
                 None if entry.eid == match_eid => return Err(Error::InvalidResponse),
@@ -912,6 +890,54 @@ fn ambiguous_request_failure(failure: RequestFailure) -> Error {
     match failure {
         RequestFailure::BodyLimit => Error::Ambiguous,
         failure => failure.into(),
+    }
+}
+
+fn decode_add_package(
+    client: &Client,
+    body: &[u8],
+    expected_eid: &str,
+) -> Result<AddPackageResult> {
+    let Some(parsed) = wire::parse_add(body) else {
+        return Err(Error::Ambiguous);
+    };
+    if parsed.status.is_none() {
+        return Err(Error::Ambiguous);
+    }
+    if let Err(error) = wire::top_level_status_error(parsed.status) {
+        return Err(if error == Error::InvalidResponse {
+            Error::Ambiguous
+        } else {
+            error
+        });
+    }
+    if parsed.packages.len() != 1 || parsed.packages[0].eid != expected_eid {
+        return Err(Error::Ambiguous);
+    }
+    let entry = &parsed.packages[0];
+    let Some(entry_status) = entry.status else {
+        return Err(Error::Ambiguous);
+    };
+    match entry_status {
+        200 | 208 => {
+            let Some(package_id) = &entry.package_id else {
+                return Err(Error::Ambiguous);
+            };
+            if entry.carrier_id.is_empty()
+                || !wire::valid_branch_field(&entry.carrier_id, wire::IDENTIFIER_LIMIT)
+                || !wire::valid_label_url(client, &entry.label_url)
+            {
+                return Err(Error::Ambiguous);
+            }
+            Ok(AddPackageResult {
+                package_id: package_id.clone(),
+                carrier_id: entry.carrier_id.clone(),
+                label_url: entry.label_url.clone(),
+            })
+        }
+        426 | 503 => Err(Error::Unavailable { retry_after: None }),
+        400 | 403 | 404 | 405 | 406 | 409 | 413 | 423 | 501 => Err(Error::Rejected),
+        _ => Err(Error::Ambiguous),
     }
 }
 

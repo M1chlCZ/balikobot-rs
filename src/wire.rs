@@ -62,6 +62,29 @@ pub fn request(
     path: &str,
     body: Option<&Value>,
 ) -> Result<RawResponse, RequestFailure> {
+    send(client, method, path, body, false)
+}
+
+/// Sends a JSON request and also reads a JSON error body, because `ADD` can
+/// report a carrier outage inside an HTTP error answer. A missing, unreadable
+/// or oversized error body is dropped so the caller keeps the HTTP
+/// classification.
+pub fn request_with_error_body(
+    client: &Client,
+    method: http::Method,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<RawResponse, RequestFailure> {
+    send(client, method, path, body, true)
+}
+
+fn send(
+    client: &Client,
+    method: http::Method,
+    path: &str,
+    body: Option<&Value>,
+    read_error_body: bool,
+) -> Result<RawResponse, RequestFailure> {
     if method != http::Method::GET {
         client
             .verify_write_allowed()
@@ -86,21 +109,28 @@ pub fn request(
         .run(request)
         .map_err(RequestFailure::Transport)?;
     let (parts, body) = response.into_parts();
+    let status = parts.status.as_u16();
+    let read_error =
+        read_error_body && (400..600).contains(&status) && headers_are_json(&parts.headers);
     let mut bytes = Vec::new();
-    if parts.status.as_u16() == 200 {
+    if status == 200 || read_error {
         let limit = client.max_response_bytes;
         let mut reader = body.into_reader();
-        reader
+        let read = reader
             .by_ref()
             .take(limit as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| RequestFailure::Transport(ureq::Error::Io(error)))?;
-        if bytes.len() > limit {
-            return Err(RequestFailure::BodyLimit);
+            .read_to_end(&mut bytes);
+        if status == 200 {
+            read.map_err(|error| RequestFailure::Transport(ureq::Error::Io(error)))?;
+            if bytes.len() > limit {
+                return Err(RequestFailure::BodyLimit);
+            }
+        } else if read.is_err() || bytes.len() > limit {
+            bytes.clear();
         }
     }
     Ok(RawResponse {
-        status: parts.status.as_u16(),
+        status,
         headers: parts.headers,
         body: bytes,
     })
@@ -108,8 +138,11 @@ pub fn request(
 
 /// Reports whether the response declares a JSON content type.
 pub fn is_json(response: &RawResponse) -> bool {
-    response
-        .headers
+    headers_are_json(&response.headers)
+}
+
+fn headers_are_json(headers: &http::HeaderMap) -> bool {
+    headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_media_type)
@@ -444,15 +477,17 @@ pub struct AddPackageStatus {
     pub label_url: String,
 }
 
-/// The decoded body of an `OVERVIEW` response.
+/// The decoded body of an `OVERVIEW` response. `packages` is `None` when the
+/// provider omitted the array or sent `null`, which is not the same as an
+/// explicit empty list.
 #[derive(Debug, Deserialize)]
 pub struct OverviewResponse {
     /// The top-level body status, when the provider sent a valid one.
     #[serde(default, deserialize_with = "deserialize_status")]
     pub status: Option<i64>,
     /// The decoded package entries.
-    #[serde(default, deserialize_with = "deserialize_lenient_list")]
-    pub packages: Vec<OverviewPackageStatus>,
+    #[serde(default, deserialize_with = "deserialize_present_list")]
+    pub packages: Option<Vec<OverviewPackageStatus>>,
 }
 
 /// One open package entry of an `OVERVIEW` response.
@@ -596,6 +631,48 @@ pub struct PickupResponse {
 /// Decodes an `ADD` response body.
 pub fn parse_add(body: &[u8]) -> Option<AddResponse> {
     parse_object(body)
+}
+
+/// Reports whether an `ADD` failure body names a carrier error for the
+/// expected `eid`. Only the failure fields are inspected, because carriers can
+/// omit or null the label fields.
+pub fn add_carrier_outage(body: &[u8], expected_eid: &str) -> bool {
+    let Some(reply) = parse_object::<AddOutageResponse>(body) else {
+        return false;
+    };
+    if reply.packages.len() != 1 {
+        return false;
+    }
+    let entry = &reply.packages[0];
+    if entry.eid != expected_eid || !matches!(entry.status, Some(400..=599)) {
+        return false;
+    }
+    entry
+        .errors
+        .iter()
+        .any(|issue| issue.attribute == "carrier_error")
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AddOutageResponse {
+    #[serde(default, deserialize_with = "deserialize_lenient_list")]
+    packages: Vec<AddOutagePackage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AddOutagePackage {
+    #[serde(default, deserialize_with = "deserialize_string")]
+    eid: String,
+    #[serde(default, deserialize_with = "deserialize_status")]
+    status: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_list")]
+    errors: Vec<AddOutageIssue>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AddOutageIssue {
+    #[serde(default, deserialize_with = "deserialize_string")]
+    attribute: String,
 }
 
 /// Decodes an `OVERVIEW` response body.
@@ -876,6 +953,15 @@ where
         .into_iter()
         .map(Option::unwrap_or_default)
         .collect())
+}
+
+fn deserialize_present_list<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<Vec<Option<T>>>::deserialize(deserializer)?
+        .map(|items| items.into_iter().map(Option::unwrap_or_default).collect()))
 }
 
 fn deserialize_package_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>

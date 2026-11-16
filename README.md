@@ -1,6 +1,6 @@
 # balikobot
 
-A Rust client for the Balíkobot shipping API v2. The client is blocking and
+`balikobot` is a blocking Rust client for the Balíkobot shipping API v2. It
 covers branches, packages, labels, tracking, pickup orders, account
 capabilities and tracking webhooks. The default endpoint is
 `https://apiv2.balikobot.cz`.
@@ -122,7 +122,7 @@ client rejects other well-formed currency codes before the request.
 
 ## Errors
 
-The client returns six sentinel errors:
+The client returns seven sentinel errors:
 
 | Error | Meaning | Action |
 | --- | --- | --- |
@@ -131,7 +131,11 @@ The client returns six sentinel errors:
 | `Error::Unavailable` | The provider is unavailable, or the request never left the client. | Retry later. |
 | `Error::NotFound` | The carrier has no tracking data yet. | Poll again later. |
 | `Error::Ambiguous` | A mutating call can have reached the provider. | Reconcile with `overview`. Then retry. |
+| `Error::CarrierOutage` | The carrier reported an error for the `eid` during `ADD`, so the package may exist. | Reconcile with `overview`. Then retry. |
 | `Error::InvalidResponse` | The answer violates the protocol. | Inspect the provider. Do not retry blindly. |
+
+`Error::CarrierOutage` counts as ambiguous: `Error::is_ambiguous` returns
+`true` for both variants.
 
 `Error::Unavailable` carries an optional `retry_after` field. The field holds
 the provider `Retry-After` hint. Read the hint with `Error::retry_after`:
@@ -152,7 +156,7 @@ The client sends no automatic retry. The caller controls the retry policy.
 The client reads every JSON body with a hard limit of 8 MiB. Set
 `Config::with_max_response_bytes` to change the limit. Label downloads,
 including batch downloads, use a fixed limit of 4 MiB. The client refuses
-redirects. It compares the response `Content-Type` with the expected media
+redirects and compares the response `Content-Type` with the expected media
 type before it decodes the body.
 
 ## Account mode
