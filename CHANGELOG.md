@@ -1,3 +1,12 @@
+## [0.2.1] - 2026-11-16
+
+- ADD reports a matching package's `carrier_error` as `Error::CarrierOutage`,
+  including in HTTP error responses. `Error::is_ambiguous` returns `true` for
+  it, so treat it like `Error::Ambiguous` and reconcile with `overview` before
+  another attempt.
+- OVERVIEW requires an explicit package array. A missing or null array reports
+  `Error::InvalidResponse` instead of an empty list.
+
 ## [0.2.0] - 2026-10-13
 
 - Batch label download through `Client::download_batch_labels`: a single
